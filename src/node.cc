@@ -522,6 +522,11 @@ static Handle<Value> SetSid(const Arguments& args) {
   return scope.Close(Integer::New(sid));
 }
 
+static Handle<Value> Fork(const Arguments& args) {
+  HandleScope scope;
+  return scope.Close(Integer::New(fork()));
+};
+
 v8::Handle<v8::Value> Exit(const v8::Arguments& args) {
   HandleScope scope;
   fflush(stderr);
@@ -1012,6 +1017,7 @@ static void Load(int argc, char *argv[]) {
   NODE_SET_METHOD(process, "getppid", GetPpid);
   NODE_SET_METHOD(process, "getsid", GetSid);
   NODE_SET_METHOD(process, "setsid", SetSid);
+  NODE_SET_METHOD(process, "fork", Fork);
   NODE_SET_METHOD(process, "umask", Umask);
   NODE_SET_METHOD(process, "dlopen", DLOpen);
   NODE_SET_METHOD(process, "kill", Kill);
