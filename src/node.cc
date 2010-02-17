@@ -10,7 +10,7 @@
 #include <errno.h>
 #include <dlfcn.h> /* dlopen(), dlsym() */
 #include <sys/types.h>
-#include <unistd.h> /* setuid, getuid */
+#include <unistd.h> /* setuid, getuid, setsid */
 
 #include <node_events.h>
 #include <node_dns.h>
@@ -473,6 +473,17 @@ static Handle<Value> GetUid(const Arguments& args) {
   return scope.Close(Integer::New(uid));
 }
 
+static Handle<Value> GetPid(const Arguments& args) {
+  HandleScope scope;
+  pid_t pid = getpid();
+  return scope.Close(Integer::New(pid));
+}
+
+static Handle<Value> GetPpid(const Arguments& args) {
+  HandleScope scope;
+  pid_t ppid = getppid();
+  return scope.Close(Integer::New(ppid));
+}
 
 static Handle<Value> SetUid(const Arguments& args) {
   HandleScope scope;
@@ -491,6 +502,25 @@ static Handle<Value> SetUid(const Arguments& args) {
   return Undefined();
 }
 
+static Handle<Value> GetSid(const Arguments& args) {
+  HandleScope scope;
+
+  pid_t pid;
+  if (args.Length() < 1) {
+    pid = 0;
+  } else {
+    Local<Integer> given_pid = args[0]->ToInteger();
+    pid = (pid_t) given_pid->Int32Value();
+  }
+  pid_t sid = getsid(pid);
+  return scope.Close(Integer::New(sid));
+}
+
+static Handle<Value> SetSid(const Arguments& args) {
+  HandleScope scope;
+  pid_t sid = setsid();
+  return scope.Close(Integer::New(sid));
+}
 
 v8::Handle<v8::Value> Exit(const v8::Arguments& args) {
   HandleScope scope;
@@ -978,6 +1008,10 @@ static void Load(int argc, char *argv[]) {
   NODE_SET_METHOD(process, "cwd", Cwd);
   NODE_SET_METHOD(process, "getuid", GetUid);
   NODE_SET_METHOD(process, "setuid", SetUid);
+  NODE_SET_METHOD(process, "getpid", GetPid);
+  NODE_SET_METHOD(process, "getppid", GetPpid);
+  NODE_SET_METHOD(process, "getsid", GetSid);
+  NODE_SET_METHOD(process, "setsid", SetSid);
   NODE_SET_METHOD(process, "umask", Umask);
   NODE_SET_METHOD(process, "dlopen", DLOpen);
   NODE_SET_METHOD(process, "kill", Kill);

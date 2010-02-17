@@ -147,6 +147,22 @@ Sets the process's file mode creation mask. Child processes inherit the mask
 from the parent process.
   - returns the old mask.
 
++process.getpid()+::
+Returns the process ID of the current process.
+
++process.getppid()+::
+Returns the process ID of the parent of the current process.
+
++process.getsid(pid)+::
+Calling with +pid = 0+ returns the session ID of the current process.
+Calling with any other value returns the session ID of the process
+identified by +pid+. See getsid(2) for more information.
+
++process.setsid()+::
+Create a new session, and set the calling process as the leader of the
+session. On success the session id of the calling process is returned.
+See setsid(2) for more information.
+
 +process.kill(pid, signal="SIGTERM")+ ::
 Send a signal to a process. +pid+ is the process id and +signal+ is the
 signal to send; for example, "SIGINT" or "SIGUSR1".  See kill(2) for more
