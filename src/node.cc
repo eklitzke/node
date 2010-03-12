@@ -1129,6 +1129,7 @@ static void Load(int argc, char *argv[]) {
   process->Set(String::NewSymbol("env"), env);
 
   process->Set(String::NewSymbol("pid"), Integer::New(getpid()));
+  process->Set(String::NewSymbol("five"), Integer::New(5));
 
   // define various internal methods
   NODE_SET_METHOD(process, "loop", Loop);
