@@ -60,13 +60,28 @@ static Persistent<String> listeners_symbol;
 static Persistent<String> uncaught_exception_symbol;
 static Persistent<String> emit_symbol;
 
-static int dash_dash_index = 0;
+static int option_end_index = 0;
 static bool use_debug_agent = false;
+static bool debug_wait_connect = false;
+static int debug_port=5858;
 
 
 static ev_async eio_want_poll_notifier;
 static ev_async eio_done_poll_notifier;
 static ev_idle  eio_poller;
+
+static ev_timer  gc_timer;
+#define GC_INTERVAL 2.0
+
+
+// Node calls this every GC_INTERVAL seconds in order to try and call the
+// GC. This watcher is run with maximum priority, so ev_pending_count() == 0
+// is an effective measure of idleness.
+static void GCTimeout(EV_P_ ev_timer *watcher, int revents) {
+  assert(watcher == &gc_timer);
+  assert(revents == EV_TIMER);
+  if (ev_pending_count(EV_DEFAULT_UC) == 0) V8::IdleNotification();
+}
 
 
 static void DoPoll(EV_P_ ev_idle *watcher, int revents) {
@@ -155,7 +170,7 @@ enum encoding ParseEncoding(Handle<Value> encoding_v, enum encoding _default) {
 Local<Value> Encode(const void *buf, size_t len, enum encoding encoding) {
   HandleScope scope;
 
-  if (!len) return scope.Close(Null());
+  if (!len) return scope.Close(String::Empty());
 
   if (encoding == BINARY) {
     const unsigned char *cbuf = static_cast<const unsigned char*>(buf);
@@ -320,11 +335,6 @@ const char* ToCString(const v8::String::Utf8Value& value) {
 
 static void ReportException(TryCatch &try_catch, bool show_line = false) {
   Handle<Message> message = try_catch.Message();
-  if (message.IsEmpty()) {
-    fprintf(stderr, "Error: (no message)\n");
-    fflush(stderr);
-    return;
-  }
 
   Handle<Value> error = try_catch.Exception();
   Handle<String> stack;
@@ -335,7 +345,7 @@ static void ReportException(TryCatch &try_catch, bool show_line = false) {
     if (raw_stack->IsString()) stack = Handle<String>::Cast(raw_stack);
   }
 
-  if (show_line) {
+  if (show_line && !message.IsEmpty()) {
     // Print (filename):(line number): (message).
     String::Utf8Value filename(message->GetScriptResourceName());
     const char* filename_string = ToCString(filename);
@@ -410,6 +420,7 @@ static Handle<Value> Loop(const Arguments& args) {
 }
 
 static Handle<Value> Unloop(const Arguments& args) {
+  fprintf(stderr, "Deprecation: Don't use process.unloop(). It will be removed soon.\n");
   HandleScope scope;
   int how = EVUNLOOP_ONE;
   if (args[0]->IsString()) {
@@ -455,14 +466,18 @@ static Handle<Value> Cwd(const Arguments& args) {
 
 static Handle<Value> Umask(const Arguments& args){
   HandleScope scope;
-
-  if(args.Length() < 1 || !args[0]->IsInt32()) {
+  unsigned int old;
+  if(args.Length() < 1) {
+    old = umask(0);
+    umask((mode_t)old);
+  }
+  else if(!args[0]->IsInt32()) {
     return ThrowException(Exception::TypeError(
           String::New("argument must be an integer.")));
   }
-  unsigned int mask = args[0]->Uint32Value();
-  unsigned int old = umask((mode_t)mask);
-
+  else {
+    old = umask((mode_t)args[0]->Uint32Value());
+  }
   return scope.Close(Uint32::New(old));
 }
 
@@ -483,6 +498,29 @@ static Handle<Value> GetPpid(const Arguments& args) {
   HandleScope scope;
   pid_t ppid = getppid();
   return scope.Close(Integer::New(ppid));
+
+static Handle<Value> GetGid(const Arguments& args) {
+  HandleScope scope;
+  int gid = getgid();
+  return scope.Close(Integer::New(gid));
+}
+
+
+static Handle<Value> SetGid(const Arguments& args) {
+  HandleScope scope;
+  
+  if (args.Length() < 1) {
+    return ThrowException(Exception::Error(
+	  String::New("setgid requires 1 argument")));
+  }
+
+  Local<Integer> given_gid = args[0]->ToInteger();
+  int gid = given_gid->Int32Value();
+  int result;
+  if ((result = setgid(gid)) != 0) {
+    return ThrowException(Exception::Error(String::New(strerror(errno))));
+  }
+  return Undefined();
 }
 
 static Handle<Value> SetUid(const Arguments& args) {
@@ -594,6 +632,7 @@ int getmem(size_t *rss, size_t *vsize) {
   struct kinfo_proc *kinfo = NULL;
   pid_t pid;
   int nprocs;
+  size_t page_size = getpagesize();
 
   pid = getpid();
 
@@ -603,7 +642,7 @@ int getmem(size_t *rss, size_t *vsize) {
   kinfo = kvm_getprocs(kd, KERN_PROC_PID, pid, &nprocs);
   if (kinfo == NULL) goto error;
 
-  *rss = kinfo->ki_rssize * PAGE_SIZE;
+  *rss = kinfo->ki_rssize * page_size;
   *vsize = kinfo->ki_size;
 
   kvm_close(kd);
@@ -842,6 +881,53 @@ Handle<Value> DLOpen(const v8::Arguments& args) {
   return Undefined();
 }
 
+// evalcx(code, sandbox={})
+// Executes code in a new context
+Handle<Value> EvalCX(const Arguments& args) {
+  HandleScope scope;
+
+  Local<String> code = args[0]->ToString();
+  Local<Object> sandbox = args.Length() > 1 ? args[1]->ToObject()
+                                            : Object::New();
+  // Create the new context
+  Persistent<Context> context = Context::New();
+
+  // Copy objects from global context, to our brand new context
+  Handle<Array> keys = sandbox->GetPropertyNames();
+
+  int i;
+  for (i = 0; i < keys->Length(); i++) {
+    Handle<String> key = keys->Get(Integer::New(i))->ToString();
+    Handle<Value> value = sandbox->Get(key);
+    context->Global()->Set(key, value->ToObject()->Clone());
+  }
+
+  // Enter and compile script
+  context->Enter();
+
+  // Catch errors
+  TryCatch try_catch;
+
+  Local<Script> script = Script::Compile(code, String::New("evalcx"));
+  Handle<Value> result;
+
+  if (script.IsEmpty()) {
+    result = ThrowException(try_catch.Exception());
+  } else {
+    result = script->Run();
+    if (result.IsEmpty()) {
+      result = ThrowException(try_catch.Exception());
+    }
+  }
+
+  // Clean up, clean up, everybody everywhere!
+  context->DetachGlobal();
+  context->Exit();
+  context.Dispose();
+
+  return scope.Close(result);
+}
+
 Handle<Value> Compile(const Arguments& args) {
   HandleScope scope;
 
@@ -931,12 +1017,13 @@ void FatalException(TryCatch &try_catch) {
 
 
 static ev_async debug_watcher;
+volatile static bool debugger_msg_pending = false;
 
 static void DebugMessageCallback(EV_P_ ev_async *watcher, int revents) {
   HandleScope scope;
   assert(watcher == &debug_watcher);
   assert(revents == EV_ASYNC);
-  ExecuteString(String::New("1+1;"), String::New("debug_poll"));
+  Debug::ProcessDebugMessages();
 }
 
 static void DebugMessageDispatch(void) {
@@ -945,7 +1032,47 @@ static void DebugMessageDispatch(void) {
 
   // Send a signal to our main thread saying that it should enter V8 to
   // handle the message.
+  debugger_msg_pending = true;
   ev_async_send(EV_DEFAULT_UC_ &debug_watcher);
+}
+
+static Handle<Value> CheckBreak(const Arguments& args) {
+  HandleScope scope;
+
+  // TODO FIXME This function is a hack to wait until V8 is ready to accept
+  // commands. There seems to be a bug in EnableAgent( _ , _ , true) which
+  // makes it unusable here. Ideally we'd be able to bind EnableAgent and
+  // get it to halt until Eclipse connects.
+
+  if (!debug_wait_connect)
+    return Undefined();
+
+  printf("Waiting for remote debugger connection...\n");
+
+  const int halfSecond = 50;
+  const int tenMs=10000;
+  debugger_msg_pending = false;
+  for (;;) {
+    if (debugger_msg_pending) {
+      Debug::DebugBreak();
+      Debug::ProcessDebugMessages();
+      debugger_msg_pending = false;
+
+      // wait for 500 msec of silence from remote debugger
+      int cnt = halfSecond;
+        while (cnt --) {
+        debugger_msg_pending = false;
+        usleep(tenMs);
+        if (debugger_msg_pending) {
+          debugger_msg_pending = false;
+          cnt = halfSecond;
+        }
+      }
+      break;
+    }
+    usleep(tenMs);
+  }
+  return Undefined();
 }
 
 
@@ -973,9 +1100,9 @@ static void Load(int argc, char *argv[]) {
 
   // process.argv
   int i, j;
-  Local<Array> arguments = Array::New(argc - dash_dash_index + 1);
+  Local<Array> arguments = Array::New(argc - option_end_index + 1);
   arguments->Set(Integer::New(0), String::New(argv[0]));
-  for (j = 1, i = dash_dash_index + 1; i < argc; j++, i++) {
+  for (j = 1, i = option_end_index + 1; i < argc; j++, i++) {
     Local<String> arg = String::New(argv[i]);
     arguments->Set(Integer::New(j), arg);
   }
@@ -1006,6 +1133,7 @@ static void Load(int argc, char *argv[]) {
   // define various internal methods
   NODE_SET_METHOD(process, "loop", Loop);
   NODE_SET_METHOD(process, "unloop", Unloop);
+  NODE_SET_METHOD(process, "evalcx", EvalCX);
   NODE_SET_METHOD(process, "compile", Compile);
   NODE_SET_METHOD(process, "_byteLength", ByteLength);
   NODE_SET_METHOD(process, "reallyExit", Exit);
@@ -1018,10 +1146,13 @@ static void Load(int argc, char *argv[]) {
   NODE_SET_METHOD(process, "getsid", GetSid);
   NODE_SET_METHOD(process, "setsid", SetSid);
   NODE_SET_METHOD(process, "fork", Fork);
+  NODE_SET_METHOD(process, "setgid", SetGid);
+  NODE_SET_METHOD(process, "getgid", GetGid);
   NODE_SET_METHOD(process, "umask", Umask);
   NODE_SET_METHOD(process, "dlopen", DLOpen);
   NODE_SET_METHOD(process, "kill", Kill);
   NODE_SET_METHOD(process, "memoryUsage", MemoryUsage);
+  NODE_SET_METHOD(process, "checkBreak", CheckBreak);
 
   // Assign the EventEmitter. It was created in main().
   process->Set(String::NewSymbol("EventEmitter"),
@@ -1094,6 +1225,7 @@ static void Load(int argc, char *argv[]) {
   // Node's I/O bindings may want to replace 'f' with their own function.
 
   Local<Value> args[1] = { Local<Value>::New(process) };
+
   f->Call(global, 1, args);
 
 #ifndef NDEBUG
@@ -1104,12 +1236,52 @@ static void Load(int argc, char *argv[]) {
 #endif
 }
 
+static void PrintHelp();
+
+static void ParseDebugOpt(const char* arg) {
+  const char *p = 0;
+
+  use_debug_agent = true;
+  if (!strcmp (arg, "--debug-brk")) {
+    debug_wait_connect = true;
+    return;
+  } else if (!strcmp(arg, "--debug")) {
+    return;
+  } else if (strstr(arg, "--debug-brk=") == arg) {
+    debug_wait_connect = true;
+    p = 1 + strchr(arg, '=');
+    debug_port = atoi(p);
+  } else if (strstr(arg, "--debug=") == arg) {
+    p = 1 + strchr(arg, '=');
+    debug_port = atoi(p);
+  }
+  if (p && debug_port > 1024 && debug_port <  65536)
+      return;
+
+  fprintf(stderr, "Bad debug option.\n");
+  if (p) fprintf(stderr, "Debug port must be in range 1025 to 65535.\n");
+
+  PrintHelp();
+  exit(1);
+}
+
 static void PrintHelp() {
-  printf("Usage: node [options] [--] script.js [arguments] \n"
-         "  -v, --version    print node's version\n"
-         "  --debug          enable remote debugging\n" // TODO specify port
-         "  --cflags         print pre-processor and compiler flags\n"
-         "  --v8-options     print v8 command line options\n\n"
+  printf("Usage: node [options] script.js [arguments] \n"
+         "Options:\n"
+         "  -v, --version      print node's version\n"
+         "  --debug[=port]     enable remote debugging via given TCP port\n"
+         "                     without stopping the execution\n"
+         "  --debug-brk[=port] as above, but break in script.js and\n"
+         "                     wait for remote debugger to connect\n"
+         "  --v8-options       print v8 command line options\n"
+         "  --vars             print various compiled-in variables\n"
+         "\n"
+         "Enviromental variables:\n"
+         "NODE_PATH            ':'-separated list of directories\n"
+         "                     prefixed to the module search path,\n"
+         "                     require.paths.\n"
+         "NODE_DEBUG           Print additional debugging output.\n"
+         "\n"
          "Documentation can be found at http://nodejs.org/api.html"
          " or with 'man node'\n");
 }
@@ -1119,25 +1291,27 @@ static void ParseArgs(int *argc, char **argv) {
   // TODO use parse opts
   for (int i = 1; i < *argc; i++) {
     const char *arg = argv[i];
-    if (strcmp(arg, "--") == 0) {
-      dash_dash_index = i;
-      break;
-    } else if (strcmp(arg, "--debug") == 0) {
-      argv[i] = reinterpret_cast<const char*>("");
-      use_debug_agent = true;
-      dash_dash_index = i;
+    if (strstr(arg, "--debug") == arg) {
+      ParseDebugOpt(arg);
+      argv[i] = const_cast<char*>("");
+      option_end_index = i;
     } else if (strcmp(arg, "--version") == 0 || strcmp(arg, "-v") == 0) {
       printf("%s\n", NODE_VERSION);
       exit(0);
-    } else if (strcmp(arg, "--cflags") == 0) {
-      printf("%s\n", NODE_CFLAGS);
+    } else if (strcmp(arg, "--vars") == 0) {
+      printf("NODE_PREFIX: %s\n", NODE_PREFIX);
+      printf("NODE_LIBRARIES_PREFIX: %s/%s\n", NODE_PREFIX, "lib/node/libraries");
+      printf("NODE_CFLAGS: %s\n", NODE_CFLAGS);
       exit(0);
     } else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
       PrintHelp();
       exit(0);
     } else if (strcmp(arg, "--v8-options") == 0) {
-      argv[i] = reinterpret_cast<const char*>("--help");
-      dash_dash_index = i+1;
+      argv[i] = const_cast<char*>("--help");
+      option_end_index = i+1;
+    } else if (argv[i][0] != '-') {
+      option_end_index = i-1;
+      break;
     }
   }
 }
@@ -1148,9 +1322,9 @@ static void ParseArgs(int *argc, char **argv) {
 int main(int argc, char *argv[]) {
   // Parse a few arguments which are specific to Node.
   node::ParseArgs(&argc, argv);
-  // Parse the rest of the args (up to the 'dash_dash_index' (where '--' was
+  // Parse the rest of the args (up to the 'option_end_index' (where '--' was
   // in the command line))
-  V8::SetFlagsFromCommandLine(&node::dash_dash_index, argv, false);
+  V8::SetFlagsFromCommandLine(&node::option_end_index, argv, false);
 
   // Error out if we don't have a script argument.
   if (argc < 2) {
@@ -1163,7 +1337,25 @@ int main(int argc, char *argv[]) {
   evcom_ignore_sigpipe();
 
   // Initialize the default ev loop.
+#ifdef __sun
+  // TODO(Ryan) I'm experiencing abnormally high load using Solaris's
+  // EVBACKEND_PORT. Temporarally forcing select() until I debug.
+  ev_default_loop(EVBACKEND_SELECT);
+#else
   ev_default_loop(EVFLAG_AUTO);
+#endif
+
+
+  ev_timer_init(&node::gc_timer, node::GCTimeout, GC_INTERVAL, GC_INTERVAL);
+  // Set the gc_timer to max priority so that it runs before all other
+  // watchers. In this way it can check if the 'tick' has other pending
+  // watchers by using ev_pending_count() - if it ran with lower priority
+  // then the other watchers might run before it - not giving us good idea
+  // of loop idleness.
+  ev_set_priority(&node::gc_timer, EV_MAXPRI);
+  ev_timer_start(EV_DEFAULT_UC_ &node::gc_timer);
+  ev_unref(EV_DEFAULT_UC);
+
 
   // Setup the EIO thread pool
   { // It requires 3, yes 3, watchers.
@@ -1188,18 +1380,15 @@ int main(int argc, char *argv[]) {
 
   V8::SetFatalErrorHandler(node::OnFatalError);
 
-#define AUTO_BREAK_FLAG "--debugger_auto_break"
   // If the --debug flag was specified then initialize the debug thread.
   if (node::use_debug_agent) {
-    // First apply --debugger_auto_break setting to V8. This is so we can
-    // enter V8 by just executing any bit of javascript
-    V8::SetFlagsFromString(AUTO_BREAK_FLAG, sizeof(AUTO_BREAK_FLAG));
     // Initialize the async watcher for receiving messages from the debug
     // thread and marshal it into the main thread. DebugMessageCallback()
     // is called from the main thread to execute a random bit of javascript
     // - which will give V8 control so it can handle whatever new message
     // had been received on the debug thread.
     ev_async_init(&node::debug_watcher, node::DebugMessageCallback);
+    ev_set_priority(&node::debug_watcher, EV_MAXPRI);
     // Set the callback DebugMessageDispatch which is called from the debug
     // thread.
     Debug::SetDebugMessageDispatchHandler(node::DebugMessageDispatch);
@@ -1209,12 +1398,12 @@ int main(int argc, char *argv[]) {
     ev_unref(EV_DEFAULT_UC);
 
     // Start the debug thread and it's associated TCP server on port 5858.
-    bool r = Debug::EnableAgent("node " NODE_VERSION, 5858);
+    bool r = Debug::EnableAgent("node " NODE_VERSION, node::debug_port);
+
     // Crappy check that everything went well. FIXME
     assert(r);
-    // Print out some information. REMOVEME
-    printf("debugger listening on port 5858\n"
-           "Use 'd8 --remote_debugger' to access it.\n");
+    // Print out some information.
+    printf("debugger listening on port %d\n", node::debug_port);
   }
 
   // Create the one and only Context.

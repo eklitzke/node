@@ -157,7 +157,9 @@ class BitField {
 
   // Returns a uint32_t mask of bit field.
   static uint32_t mask() {
-    return (1U << (size + shift)) - (1U << shift);
+    // To use all bits of a uint32 in a bitfield without compiler warnings we
+    // have to compute 2^32 without using a shift count of 32.
+    return ((1U << shift) << size) - (1U << shift);
   }
 
   // Returns a uint32_t with the bit field value encoded.
@@ -168,51 +170,9 @@ class BitField {
 
   // Extracts the bit field from the value.
   static T decode(uint32_t value) {
-    return static_cast<T>((value >> shift) & ((1U << (size)) - 1));
+    return static_cast<T>((value & mask()) >> shift);
   }
 };
-
-
-// ----------------------------------------------------------------------------
-// Support for compressed, machine-independent encoding
-// and decoding of integer values of arbitrary size.
-
-// Encoding and decoding from/to a buffer at position p;
-// the result is the position after the encoded integer.
-// Small signed integers in the range -64 <= x && x < 64
-// are encoded in 1 byte; larger values are encoded in 2
-// or more bytes. At most sizeof(int) + 1 bytes are used
-// in the worst case.
-byte* EncodeInt(byte* p, int x);
-byte* DecodeInt(byte* p, int* x);
-
-
-// Encoding and decoding from/to a buffer at position p - 1
-// moving backward; the result is the position of the last
-// byte written. These routines are useful to read/write
-// into a buffer starting at the end of the buffer.
-byte* EncodeUnsignedIntBackward(byte* p, unsigned int x);
-
-// The decoding function is inlined since its performance is
-// important to mark-sweep garbage collection.
-inline byte* DecodeUnsignedIntBackward(byte* p, unsigned int* x) {
-  byte b = *--p;
-  if (b >= 128) {
-    *x = static_cast<unsigned int>(b) - 128;
-    return p;
-  }
-  unsigned int r = static_cast<unsigned int>(b);
-  unsigned int s = 7;
-  b = *--p;
-  while (b < 128) {
-    r |= static_cast<unsigned int>(b) << s;
-    s += 7;
-    b = *--p;
-  }
-  // b >= 128
-  *x = r | ((static_cast<unsigned int>(b) - 128) << s);
-  return p;
-}
 
 
 // ----------------------------------------------------------------------------
@@ -568,11 +528,11 @@ static inline void CopyChars(sinkchar* dest, const sourcechar* src, int chars) {
   sinkchar* limit = dest + chars;
 #ifdef V8_HOST_CAN_READ_UNALIGNED
   if (sizeof(*dest) == sizeof(*src)) {
-    // Number of characters in a uint32_t.
-    static const int kStepSize = sizeof(uint32_t) / sizeof(*dest);  // NOLINT
+    // Number of characters in a uintptr_t.
+    static const int kStepSize = sizeof(uintptr_t) / sizeof(*dest);  // NOLINT
     while (dest <= limit - kStepSize) {
-      *reinterpret_cast<uint32_t*>(dest) =
-          *reinterpret_cast<const uint32_t*>(src);
+      *reinterpret_cast<uintptr_t*>(dest) =
+          *reinterpret_cast<const uintptr_t*>(src);
       dest += kStepSize;
       src += kStepSize;
     }
@@ -581,6 +541,58 @@ static inline void CopyChars(sinkchar* dest, const sourcechar* src, int chars) {
   while (dest < limit) {
     *dest++ = static_cast<sinkchar>(*src++);
   }
+}
+
+
+// Compare ASCII/16bit chars to ASCII/16bit chars.
+template <typename lchar, typename rchar>
+static inline int CompareChars(const lchar* lhs, const rchar* rhs, int chars) {
+  const lchar* limit = lhs + chars;
+#ifdef V8_HOST_CAN_READ_UNALIGNED
+  if (sizeof(*lhs) == sizeof(*rhs)) {
+    // Number of characters in a uintptr_t.
+    static const int kStepSize = sizeof(uintptr_t) / sizeof(*lhs);  // NOLINT
+    while (lhs <= limit - kStepSize) {
+      if (*reinterpret_cast<const uintptr_t*>(lhs) !=
+          *reinterpret_cast<const uintptr_t*>(rhs)) {
+        break;
+      }
+      lhs += kStepSize;
+      rhs += kStepSize;
+    }
+  }
+#endif
+  while (lhs < limit) {
+    int r = static_cast<int>(*lhs) - static_cast<int>(*rhs);
+    if (r != 0) return r;
+    ++lhs;
+    ++rhs;
+  }
+  return 0;
+}
+
+
+template <typename T>
+static inline void MemsetPointer(T** dest, T* value, int counter) {
+#if defined(V8_HOST_ARCH_IA32)
+#define STOS "stosl"
+#elif defined(V8_HOST_ARCH_X64)
+#define STOS "stosq"
+#endif
+
+#if defined(__GNUC__) && defined(STOS)
+  asm("cld;"
+      "rep ; " STOS
+      : /* no output */
+      : "c" (counter), "a" (value), "D" (dest)
+      : /* no clobbered list as all inputs are considered clobbered */);
+#else
+  for (int i = 0; i < counter; i++) {
+    dest[i] = value;
+  }
+#endif
+
+#undef STOS
 }
 
 

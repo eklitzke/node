@@ -38,6 +38,7 @@
 #include "debug.h"
 #include "execution.h"
 #include "jsregexp.h"
+#include "liveedit.h"
 #include "parser.h"
 #include "platform.h"
 #include "runtime.h"
@@ -596,8 +597,9 @@ static Object* Runtime_GetOwnProperty(Arguments args) {
 
   if (result.type() == CALLBACKS) {
     Object* structure = result.GetCallbackObject();
-    if (structure->IsProxy()) {
-      // Property that is internally implemented as a callback.
+    if (structure->IsProxy() || structure->IsAccessorInfo()) {
+      // Property that is internally implemented as a callback or
+      // an API defined callback.
       Object* value = obj->GetPropertyWithCallback(
           obj, structure, name, result.holder());
       elms->set(0, Heap::false_value());
@@ -609,7 +611,6 @@ static Object* Runtime_GetOwnProperty(Arguments args) {
       elms->set(1, FixedArray::cast(structure)->get(0));
       elms->set(2, FixedArray::cast(structure)->get(1));
     } else {
-      // TODO(ricow): Handle API callbacks.
       return Heap::undefined_value();
     }
   } else {
@@ -619,7 +620,7 @@ static Object* Runtime_GetOwnProperty(Arguments args) {
   }
 
   elms->set(3, Heap::ToBoolean(!result.IsDontEnum()));
-  elms->set(4, Heap::ToBoolean(!result.IsReadOnly()));
+  elms->set(4, Heap::ToBoolean(!result.IsDontDelete()));
   return *desc;
 }
 
@@ -1208,17 +1209,6 @@ static Object* Runtime_OptimizeObjectForAddingMultipleProperties(
 }
 
 
-static Object* Runtime_TransformToFastProperties(Arguments args) {
-  HandleScope scope;
-  ASSERT(args.length() == 1);
-  CONVERT_ARG_CHECKED(JSObject, object, 0);
-  if (!object->HasFastProperties() && !object->IsGlobalObject()) {
-    TransformToFastProperties(object, 0);
-  }
-  return *object;
-}
-
-
 static Object* Runtime_RegExpExec(Arguments args) {
   HandleScope scope;
   ASSERT(args.length() == 4);
@@ -1238,6 +1228,17 @@ static Object* Runtime_RegExpExec(Arguments args) {
                                            last_match_info);
   if (result.is_null()) return Failure::Exception();
   return *result;
+}
+
+
+static Object* Runtime_FinishArrayPrototypeSetup(Arguments args) {
+  HandleScope scope;
+  ASSERT(args.length() == 1);
+  CONVERT_ARG_CHECKED(JSArray, prototype, 0);
+  // This is necessary to enable fast checks for absence of elements
+  // on Array.prototype and below.
+  prototype->set_elements(Heap::empty_fixed_array());
+  return Smi::FromInt(0);
 }
 
 
@@ -2287,6 +2288,20 @@ static int SingleCharIndexOf(Vector<const schar> string,
   return -1;
 }
 
+
+template <typename schar>
+static int SingleCharLastIndexOf(Vector<const schar> string,
+                                 schar pattern_char,
+                                 int start_index) {
+  for (int i = start_index; i >= 0; i--) {
+    if (pattern_char == string[i]) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+
 // Trivial string search for shorter strings.
 // On return, if "complete" is set to true, the return value is the
 // final result of searching for the patter in the subject.
@@ -2363,7 +2378,7 @@ static int StringMatchStrategy(Vector<const schar> sub,
   // We have an ASCII haystack and a non-ASCII needle. Check if there
   // really is a non-ASCII character in the needle and bail out if there
   // is.
-  if (sizeof(pchar) > 1 && sizeof(schar) == 1) {
+  if (sizeof(schar) == 1 && sizeof(pchar) > 1) {
     for (int i = 0; i < pat.length(); i++) {
       uc16 c = pat[i];
       if (c > String::kMaxAsciiCharCode) {
@@ -2466,39 +2481,115 @@ static Object* Runtime_StringIndexOf(Arguments args) {
 }
 
 
+template <typename schar, typename pchar>
+static int StringMatchBackwards(Vector<const schar> sub,
+                                Vector<const pchar> pat,
+                                int idx) {
+  ASSERT(pat.length() >= 1);
+  ASSERT(idx + pat.length() <= sub.length());
+
+  if (sizeof(schar) == 1 && sizeof(pchar) > 1) {
+    for (int i = 0; i < pat.length(); i++) {
+      uc16 c = pat[i];
+      if (c > String::kMaxAsciiCharCode) {
+        return -1;
+      }
+    }
+  }
+
+  pchar pattern_first_char = pat[0];
+  for (int i = idx; i >= 0; i--) {
+    if (sub[i] != pattern_first_char) continue;
+    int j = 1;
+    while (j < pat.length()) {
+      if (pat[j] != sub[i+j]) {
+        break;
+      }
+      j++;
+    }
+    if (j == pat.length()) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 static Object* Runtime_StringLastIndexOf(Arguments args) {
-  NoHandleAllocation ha;
+  HandleScope scope;  // create a new handle scope
   ASSERT(args.length() == 3);
 
-  CONVERT_CHECKED(String, sub, args[0]);
-  CONVERT_CHECKED(String, pat, args[1]);
+  CONVERT_ARG_CHECKED(String, sub, 0);
+  CONVERT_ARG_CHECKED(String, pat, 1);
+
   Object* index = args[2];
-
-  sub->TryFlattenIfNotFlat();
-  pat->TryFlattenIfNotFlat();
-
   uint32_t start_index;
   if (!Array::IndexFromObject(index, &start_index)) return Smi::FromInt(-1);
 
-  uint32_t pattern_length = pat->length();
+  uint32_t pat_length = pat->length();
   uint32_t sub_length = sub->length();
 
-  if (start_index + pattern_length > sub_length) {
-    start_index = sub_length - pattern_length;
+  if (start_index + pat_length > sub_length) {
+    start_index = sub_length - pat_length;
   }
 
-  for (int i = start_index; i >= 0; i--) {
-    bool found = true;
-    for (uint32_t j = 0; j < pattern_length; j++) {
-      if (sub->Get(i + j) != pat->Get(j)) {
-        found = false;
-        break;
+  if (pat_length == 0) {
+    return Smi::FromInt(start_index);
+  }
+
+  if (!sub->IsFlat()) {
+    FlattenString(sub);
+  }
+
+  if (pat_length == 1) {
+    AssertNoAllocation no_heap_allocation;  // ensure vectors stay valid
+    if (sub->IsAsciiRepresentation()) {
+      uc16 pchar = pat->Get(0);
+      if (pchar > String::kMaxAsciiCharCode) {
+        return Smi::FromInt(-1);
       }
+      return Smi::FromInt(SingleCharLastIndexOf(sub->ToAsciiVector(),
+                                                static_cast<char>(pat->Get(0)),
+                                                start_index));
+    } else {
+      return Smi::FromInt(SingleCharLastIndexOf(sub->ToUC16Vector(),
+                                                pat->Get(0),
+                                                start_index));
     }
-    if (found) return Smi::FromInt(i);
   }
 
-  return Smi::FromInt(-1);
+  if (!pat->IsFlat()) {
+    FlattenString(pat);
+  }
+
+  AssertNoAllocation no_heap_allocation;  // ensure vectors stay valid
+
+  int position = -1;
+
+  if (pat->IsAsciiRepresentation()) {
+    Vector<const char> pat_vector = pat->ToAsciiVector();
+    if (sub->IsAsciiRepresentation()) {
+      position = StringMatchBackwards(sub->ToAsciiVector(),
+                                      pat_vector,
+                                      start_index);
+    } else {
+      position = StringMatchBackwards(sub->ToUC16Vector(),
+                                      pat_vector,
+                                      start_index);
+    }
+  } else {
+    Vector<const uc16> pat_vector = pat->ToUC16Vector();
+    if (sub->IsAsciiRepresentation()) {
+      position = StringMatchBackwards(sub->ToAsciiVector(),
+                                      pat_vector,
+                                      start_index);
+    } else {
+      position = StringMatchBackwards(sub->ToUC16Vector(),
+                                      pat_vector,
+                                      start_index);
+    }
+  }
+
+  return Smi::FromInt(position);
 }
 
 
@@ -2529,8 +2620,8 @@ static Object* Runtime_StringLocaleCompare(Arguments args) {
   int d = str1->Get(0) - str2->Get(0);
   if (d != 0) return Smi::FromInt(d);
 
-  str1->TryFlattenIfNotFlat();
-  str2->TryFlattenIfNotFlat();
+  str1->TryFlatten();
+  str2->TryFlatten();
 
   static StringInputBuffer buf1;
   static StringInputBuffer buf2;
@@ -2739,7 +2830,7 @@ static Object* Runtime_NumberToPrecision(Arguments args) {
 // string->Get(index).
 static Handle<Object> GetCharAt(Handle<String> string, uint32_t index) {
   if (index < static_cast<uint32_t>(string->length())) {
-    string->TryFlattenIfNotFlat();
+    string->TryFlatten();
     return LookupSingleCharacterStringFromCode(
         string->Get(index));
   }
@@ -2767,6 +2858,11 @@ Object* Runtime::GetElementOrCharAt(Handle<Object> object, uint32_t index) {
     return prototype->GetElement(index);
   }
 
+  return GetElement(object, index);
+}
+
+
+Object* Runtime::GetElement(Handle<Object> object, uint32_t index) {
   return object->GetElement(index);
 }
 
@@ -2888,6 +2984,67 @@ static Object* Runtime_KeyedGetProperty(Arguments args) {
 }
 
 
+static Object* Runtime_DefineOrRedefineAccessorProperty(Arguments args) {
+  ASSERT(args.length() == 5);
+  HandleScope scope;
+  CONVERT_ARG_CHECKED(JSObject, obj, 0);
+  CONVERT_CHECKED(String, name, args[1]);
+  CONVERT_CHECKED(Smi, flag_setter, args[2]);
+  CONVERT_CHECKED(JSFunction, fun, args[3]);
+  CONVERT_CHECKED(Smi, flag_attr, args[4]);
+  int unchecked = flag_attr->value();
+  RUNTIME_ASSERT((unchecked & ~(READ_ONLY | DONT_ENUM | DONT_DELETE)) == 0);
+  RUNTIME_ASSERT(!obj->IsNull());
+  LookupResult result;
+  obj->LocalLookupRealNamedProperty(name, &result);
+
+  PropertyAttributes attr = static_cast<PropertyAttributes>(unchecked);
+  // If an existing property is either FIELD, NORMAL or CONSTANT_FUNCTION
+  // delete it to avoid running into trouble in DefineAccessor, which
+  // handles this incorrectly if the property is readonly (does nothing)
+  if (result.IsProperty() &&
+      (result.type() == FIELD || result.type() == NORMAL
+       || result.type() == CONSTANT_FUNCTION)) {
+    obj->DeleteProperty(name, JSObject::NORMAL_DELETION);
+  }
+  return obj->DefineAccessor(name, flag_setter->value() == 0, fun, attr);
+}
+
+static Object* Runtime_DefineOrRedefineDataProperty(Arguments args) {
+  ASSERT(args.length() == 4);
+  HandleScope scope;
+  CONVERT_ARG_CHECKED(JSObject, js_object, 0);
+  CONVERT_ARG_CHECKED(String, name, 1);
+  Handle<Object> obj_value = args.at<Object>(2);
+
+  CONVERT_CHECKED(Smi, flag, args[3]);
+  int unchecked = flag->value();
+  RUNTIME_ASSERT((unchecked & ~(READ_ONLY | DONT_ENUM | DONT_DELETE)) == 0);
+
+  LookupResult result;
+  js_object->LocalLookupRealNamedProperty(*name, &result);
+
+  PropertyAttributes attr = static_cast<PropertyAttributes>(unchecked);
+
+  // Take special care when attributes are different and there is already
+  // a property. For simplicity we normalize the property which enables us
+  // to not worry about changing the instance_descriptor and creating a new
+  // map. The current version of SetObjectProperty does not handle attributes
+  // correctly in the case where a property is a field and is reset with
+  // new attributes.
+  if (result.IsProperty() && attr != result.GetAttributes()) {
+    // New attributes - normalize to avoid writing to instance descriptor
+    js_object->NormalizeProperties(CLEAR_INOBJECT_PROPERTIES, 0);
+    // Use IgnoreAttributes version since a readonly property may be
+    // overridden and SetProperty does not allow this.
+    return js_object->IgnoreAttributesAndSetLocalProperty(*name,
+                                                          *obj_value,
+                                                          attr);
+  }
+  return Runtime::SetObjectProperty(js_object, name, obj_value, attr);
+}
+
+
 Object* Runtime::SetObjectProperty(Handle<Object> object,
                                    Handle<Object> key,
                                    Handle<Object> value,
@@ -2910,8 +3067,6 @@ Object* Runtime::SetObjectProperty(Handle<Object> object,
   // Check if the given key is an array index.
   uint32_t index;
   if (Array::IndexFromObject(*key, &index)) {
-    ASSERT(attr == NONE);
-
     // In Firefox/SpiderMonkey, Safari and Opera you can access the characters
     // of a string using [] notation.  We need to support this too in
     // JavaScript.
@@ -2931,11 +3086,10 @@ Object* Runtime::SetObjectProperty(Handle<Object> object,
   if (key->IsString()) {
     Handle<Object> result;
     if (Handle<String>::cast(key)->AsArrayIndex(&index)) {
-      ASSERT(attr == NONE);
       result = SetElement(js_object, index, value);
     } else {
       Handle<String> key_string = Handle<String>::cast(key);
-      key_string->TryFlattenIfNotFlat();
+      key_string->TryFlatten();
       result = SetProperty(js_object, key_string, value, attr);
     }
     if (result.is_null()) return Failure::Exception();
@@ -2949,7 +3103,6 @@ Object* Runtime::SetObjectProperty(Handle<Object> object,
   Handle<String> name = Handle<String>::cast(converted);
 
   if (name->AsArrayIndex(&index)) {
-    ASSERT(attr == NONE);
     return js_object->SetElement(index, *value);
   } else {
     return js_object->SetProperty(*name, *value, attr);
@@ -2966,8 +3119,6 @@ Object* Runtime::ForceSetObjectProperty(Handle<JSObject> js_object,
   // Check if the given key is an array index.
   uint32_t index;
   if (Array::IndexFromObject(*key, &index)) {
-    ASSERT(attr == NONE);
-
     // In Firefox/SpiderMonkey, Safari and Opera you can access the characters
     // of a string using [] notation.  We need to support this too in
     // JavaScript.
@@ -2984,11 +3135,10 @@ Object* Runtime::ForceSetObjectProperty(Handle<JSObject> js_object,
 
   if (key->IsString()) {
     if (Handle<String>::cast(key)->AsArrayIndex(&index)) {
-      ASSERT(attr == NONE);
       return js_object->SetElement(index, *value);
     } else {
       Handle<String> key_string = Handle<String>::cast(key);
-      key_string->TryFlattenIfNotFlat();
+      key_string->TryFlatten();
       return js_object->IgnoreAttributesAndSetLocalProperty(*key_string,
                                                             *value,
                                                             attr);
@@ -3002,7 +3152,6 @@ Object* Runtime::ForceSetObjectProperty(Handle<JSObject> js_object,
   Handle<String> name = Handle<String>::cast(converted);
 
   if (name->AsArrayIndex(&index)) {
-    ASSERT(attr == NONE);
     return js_object->SetElement(index, *value);
   } else {
     return js_object->IgnoreAttributesAndSetLocalProperty(*name, *value, attr);
@@ -3041,7 +3190,7 @@ Object* Runtime::ForceDeleteObjectProperty(Handle<JSObject> js_object,
     key_string = Handle<String>::cast(converted);
   }
 
-  key_string->TryFlattenIfNotFlat();
+  key_string->TryFlatten();
   return js_object->DeleteProperty(*key_string, JSObject::FORCE_DELETION);
 }
 
@@ -3461,17 +3610,23 @@ static Object* Runtime_GetArgumentsProperty(Arguments args) {
 
 
 static Object* Runtime_ToFastProperties(Arguments args) {
+  HandleScope scope;
+
   ASSERT(args.length() == 1);
   Handle<Object> object = args.at<Object>(0);
   if (object->IsJSObject()) {
     Handle<JSObject> js_object = Handle<JSObject>::cast(object);
-    js_object->TransformToFastProperties(0);
+    if (!js_object->HasFastProperties() && !js_object->IsGlobalObject()) {
+      js_object->TransformToFastProperties(0);
+    }
   }
   return *object;
 }
 
 
 static Object* Runtime_ToSlowProperties(Arguments args) {
+  HandleScope scope;
+
   ASSERT(args.length() == 1);
   Handle<Object> object = args.at<Object>(0);
   if (object->IsJSObject()) {
@@ -3531,7 +3686,7 @@ static Object* Runtime_StringToNumber(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
   CONVERT_CHECKED(String, subject, args[0]);
-  subject->TryFlattenIfNotFlat();
+  subject->TryFlatten();
   return Heap::NumberFromDouble(StringToDouble(subject, ALLOW_HEX));
 }
 
@@ -3613,7 +3768,7 @@ static Object* Runtime_URIEscape(Arguments args) {
   ASSERT(args.length() == 1);
   CONVERT_CHECKED(String, source, args[0]);
 
-  source->TryFlattenIfNotFlat();
+  source->TryFlatten();
 
   int escaped_length = 0;
   int length = source->length();
@@ -3726,7 +3881,7 @@ static Object* Runtime_URIUnescape(Arguments args) {
   ASSERT(args.length() == 1);
   CONVERT_CHECKED(String, source, args[0]);
 
-  source->TryFlattenIfNotFlat();
+  source->TryFlatten();
 
   bool ascii = true;
   int length = source->length();
@@ -3766,7 +3921,7 @@ static Object* Runtime_StringParseInt(Arguments args) {
   CONVERT_CHECKED(String, s, args[0]);
   CONVERT_SMI_CHECKED(radix, args[1]);
 
-  s->TryFlattenIfNotFlat();
+  s->TryFlatten();
 
   int len = s->length();
   int i;
@@ -3930,18 +4085,83 @@ static Object* ConvertCaseHelper(String* s,
 }
 
 
-template <class Converter>
-static Object* ConvertCase(Arguments args,
-                           unibrow::Mapping<Converter, 128>* mapping) {
+static inline SeqAsciiString* TryGetSeqAsciiString(String* s) {
+  if (!s->IsFlat() || !s->IsAsciiRepresentation()) return NULL;
+  if (s->IsConsString()) {
+    ASSERT(ConsString::cast(s)->second()->length() == 0);
+    return SeqAsciiString::cast(ConsString::cast(s)->first());
+  }
+  return SeqAsciiString::cast(s);
+}
+
+
+namespace {
+
+struct ToLowerTraits {
+  typedef unibrow::ToLowercase UnibrowConverter;
+
+  static bool ConvertAscii(char* dst, char* src, int length) {
+    bool changed = false;
+    for (int i = 0; i < length; ++i) {
+      char c = src[i];
+      if ('A' <= c && c <= 'Z') {
+        c += ('a' - 'A');
+        changed = true;
+      }
+      dst[i] = c;
+    }
+    return changed;
+  }
+};
+
+
+struct ToUpperTraits {
+  typedef unibrow::ToUppercase UnibrowConverter;
+
+  static bool ConvertAscii(char* dst, char* src, int length) {
+    bool changed = false;
+    for (int i = 0; i < length; ++i) {
+      char c = src[i];
+      if ('a' <= c && c <= 'z') {
+        c -= ('a' - 'A');
+        changed = true;
+      }
+      dst[i] = c;
+    }
+    return changed;
+  }
+};
+
+}  // namespace
+
+
+template <typename ConvertTraits>
+static Object* ConvertCase(
+    Arguments args,
+    unibrow::Mapping<typename ConvertTraits::UnibrowConverter, 128>* mapping) {
   NoHandleAllocation ha;
-
   CONVERT_CHECKED(String, s, args[0]);
-  s->TryFlattenIfNotFlat();
+  s->TryFlatten();
 
-  int input_string_length = s->length();
+  const int length = s->length();
   // Assume that the string is not empty; we need this assumption later
-  if (input_string_length == 0) return s;
-  int length = input_string_length;
+  if (length == 0) return s;
+
+  // Simpler handling of ascii strings.
+  //
+  // NOTE: This assumes that the upper/lower case of an ascii
+  // character is also ascii.  This is currently the case, but it
+  // might break in the future if we implement more context and locale
+  // dependent upper/lower conversions.
+  SeqAsciiString* seq_ascii = TryGetSeqAsciiString(s);
+  if (seq_ascii != NULL) {
+    Object* o = Heap::AllocateRawAsciiString(length);
+    if (o->IsFailure()) return o;
+    SeqAsciiString* result = SeqAsciiString::cast(o);
+    bool has_changed_character = ConvertTraits::ConvertAscii(
+        result->GetChars(), seq_ascii->GetChars(), length);
+    return has_changed_character ? result : s;
+  }
 
   Object* answer = ConvertCaseHelper(s, length, length, mapping);
   if (answer->IsSmi()) {
@@ -3953,17 +4173,19 @@ static Object* ConvertCase(Arguments args,
 
 
 static Object* Runtime_StringToLowerCase(Arguments args) {
-  return ConvertCase<unibrow::ToLowercase>(args, &to_lower_mapping);
+  return ConvertCase<ToLowerTraits>(args, &to_lower_mapping);
 }
 
 
 static Object* Runtime_StringToUpperCase(Arguments args) {
-  return ConvertCase<unibrow::ToUppercase>(args, &to_upper_mapping);
+  return ConvertCase<ToUpperTraits>(args, &to_upper_mapping);
 }
+
 
 static inline bool IsTrimWhiteSpace(unibrow::uchar c) {
   return unibrow::WhiteSpace::Is(c) || c == 0x200b;
 }
+
 
 static Object* Runtime_StringTrim(Arguments args) {
   NoHandleAllocation ha;
@@ -3973,7 +4195,7 @@ static Object* Runtime_StringTrim(Arguments args) {
   CONVERT_BOOLEAN_CHECKED(trimLeft, args[1]);
   CONVERT_BOOLEAN_CHECKED(trimRight, args[2]);
 
-  s->TryFlattenIfNotFlat();
+  s->TryFlatten();
   int length = s->length();
 
   int left = 0;
@@ -3991,6 +4213,82 @@ static Object* Runtime_StringTrim(Arguments args) {
   }
   return s->SubString(left, right);
 }
+
+
+// Copies ascii characters to the given fixed array looking up
+// one-char strings in the cache. Gives up on the first char that is
+// not in the cache and fills the remainder with smi zeros. Returns
+// the length of the successfully copied prefix.
+static int CopyCachedAsciiCharsToArray(const char* chars,
+                                       FixedArray* elements,
+                                       int length) {
+  AssertNoAllocation nogc;
+  FixedArray* ascii_cache = Heap::single_character_string_cache();
+  Object* undefined = Heap::undefined_value();
+  int i;
+  for (i = 0; i < length; ++i) {
+    Object* value = ascii_cache->get(chars[i]);
+    if (value == undefined) break;
+    ASSERT(!Heap::InNewSpace(value));
+    elements->set(i, value, SKIP_WRITE_BARRIER);
+  }
+  if (i < length) {
+    ASSERT(Smi::FromInt(0) == 0);
+    memset(elements->data_start() + i, 0, kPointerSize * (length - i));
+  }
+#ifdef DEBUG
+  for (int j = 0; j < length; ++j) {
+    Object* element = elements->get(j);
+    ASSERT(element == Smi::FromInt(0) ||
+           (element->IsString() && String::cast(element)->LooksValid()));
+  }
+#endif
+  return i;
+}
+
+
+// Converts a String to JSArray.
+// For example, "foo" => ["f", "o", "o"].
+static Object* Runtime_StringToArray(Arguments args) {
+  HandleScope scope;
+  ASSERT(args.length() == 1);
+  CONVERT_ARG_CHECKED(String, s, 0);
+
+  s->TryFlatten();
+  const int length = s->length();
+
+  Handle<FixedArray> elements;
+  if (s->IsFlat() && s->IsAsciiRepresentation()) {
+    Object* obj = Heap::AllocateUninitializedFixedArray(length);
+    if (obj->IsFailure()) return obj;
+    elements = Handle<FixedArray>(FixedArray::cast(obj));
+
+    Vector<const char> chars = s->ToAsciiVector();
+    // Note, this will initialize all elements (not only the prefix)
+    // to prevent GC from seeing partially initialized array.
+    int num_copied_from_cache = CopyCachedAsciiCharsToArray(chars.start(),
+                                                            *elements,
+                                                            length);
+
+    for (int i = num_copied_from_cache; i < length; ++i) {
+      elements->set(i, *LookupSingleCharacterStringFromCode(chars[i]));
+    }
+  } else {
+    elements = Factory::NewFixedArray(length);
+    for (int i = 0; i < length; ++i) {
+      elements->set(i, *LookupSingleCharacterStringFromCode(s->Get(i)));
+    }
+  }
+
+#ifdef DEBUG
+  for (int i = 0; i < length; ++i) {
+    ASSERT(String::cast(elements->get(i))->length() == 1);
+  }
+#endif
+
+  return *Factory::NewJSArrayWithElements(elements);
+}
+
 
 bool Runtime::IsUpperCaseChar(uint16_t ch) {
   unibrow::uchar chars[unibrow::ToUppercase::kMaxWidth];
@@ -4014,9 +4312,12 @@ static Object* Runtime_NumberToInteger(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
-  Object* obj = args[0];
-  if (obj->IsSmi()) return obj;
-  CONVERT_DOUBLE_CHECKED(number, obj);
+  CONVERT_DOUBLE_CHECKED(number, args[0]);
+
+  // We do not include 0 so that we don't have to treat +0 / -0 cases.
+  if (number > 0 && number <= Smi::kMaxValue) {
+    return Smi::FromInt(static_cast<int>(number));
+  }
   return Heap::NumberFromDouble(DoubleToInteger(number));
 }
 
@@ -4025,9 +4326,7 @@ static Object* Runtime_NumberToJSUint32(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
-  Object* obj = args[0];
-  if (obj->IsSmi() && Smi::cast(obj)->value() >= 0) return obj;
-  CONVERT_NUMBER_CHECKED(int32_t, number, Uint32, obj);
+  CONVERT_NUMBER_CHECKED(int32_t, number, Uint32, args[0]);
   return Heap::NumberFromUint32(number);
 }
 
@@ -4036,9 +4335,12 @@ static Object* Runtime_NumberToJSInt32(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
 
-  Object* obj = args[0];
-  if (obj->IsSmi()) return obj;
-  CONVERT_DOUBLE_CHECKED(number, obj);
+  CONVERT_DOUBLE_CHECKED(number, args[0]);
+
+  // We do not include 0 so that we don't have to treat +0 / -0 cases.
+  if (number > 0 && number <= Smi::kMaxValue) {
+    return Smi::FromInt(static_cast<int>(number));
+  }
   return Heap::NumberFromInt32(DoubleToInt32(number));
 }
 
@@ -4455,6 +4757,66 @@ static Object* Runtime_SmiLexicographicCompare(Arguments args) {
 }
 
 
+static Object* StringInputBufferCompare(String* x, String* y) {
+  static StringInputBuffer bufx;
+  static StringInputBuffer bufy;
+  bufx.Reset(x);
+  bufy.Reset(y);
+  while (bufx.has_more() && bufy.has_more()) {
+    int d = bufx.GetNext() - bufy.GetNext();
+    if (d < 0) return Smi::FromInt(LESS);
+    else if (d > 0) return Smi::FromInt(GREATER);
+  }
+
+  // x is (non-trivial) prefix of y:
+  if (bufy.has_more()) return Smi::FromInt(LESS);
+  // y is prefix of x:
+  return Smi::FromInt(bufx.has_more() ? GREATER : EQUAL);
+}
+
+
+static Object* FlatStringCompare(String* x, String* y) {
+  ASSERT(x->IsFlat());
+  ASSERT(y->IsFlat());
+  Object* equal_prefix_result = Smi::FromInt(EQUAL);
+  int prefix_length = x->length();
+  if (y->length() < prefix_length) {
+    prefix_length = y->length();
+    equal_prefix_result = Smi::FromInt(GREATER);
+  } else if (y->length() > prefix_length) {
+    equal_prefix_result = Smi::FromInt(LESS);
+  }
+  int r;
+  if (x->IsAsciiRepresentation()) {
+    Vector<const char> x_chars = x->ToAsciiVector();
+    if (y->IsAsciiRepresentation()) {
+      Vector<const char> y_chars = y->ToAsciiVector();
+      r = memcmp(x_chars.start(), y_chars.start(), prefix_length);
+    } else {
+      Vector<const uc16> y_chars = y->ToUC16Vector();
+      r = CompareChars(x_chars.start(), y_chars.start(), prefix_length);
+    }
+  } else {
+    Vector<const uc16> x_chars = x->ToUC16Vector();
+    if (y->IsAsciiRepresentation()) {
+      Vector<const char> y_chars = y->ToAsciiVector();
+      r = CompareChars(x_chars.start(), y_chars.start(), prefix_length);
+    } else {
+      Vector<const uc16> y_chars = y->ToUC16Vector();
+      r = CompareChars(x_chars.start(), y_chars.start(), prefix_length);
+    }
+  }
+  Object* result;
+  if (r == 0) {
+    result = equal_prefix_result;
+  } else {
+    result = (r < 0) ? Smi::FromInt(LESS) : Smi::FromInt(GREATER);
+  }
+  ASSERT(result == StringInputBufferCompare(x, y));
+  return result;
+}
+
+
 static Object* Runtime_StringCompare(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
@@ -4477,29 +4839,18 @@ static Object* Runtime_StringCompare(Arguments args) {
   if (d < 0) return Smi::FromInt(LESS);
   else if (d > 0) return Smi::FromInt(GREATER);
 
-  x->TryFlattenIfNotFlat();
-  y->TryFlattenIfNotFlat();
+  x->TryFlatten();
+  y->TryFlatten();
 
-  static StringInputBuffer bufx;
-  static StringInputBuffer bufy;
-  bufx.Reset(x);
-  bufy.Reset(y);
-  while (bufx.has_more() && bufy.has_more()) {
-    int d = bufx.GetNext() - bufy.GetNext();
-    if (d < 0) return Smi::FromInt(LESS);
-    else if (d > 0) return Smi::FromInt(GREATER);
-  }
-
-  // x is (non-trivial) prefix of y:
-  if (bufy.has_more()) return Smi::FromInt(LESS);
-  // y is prefix of x:
-  return Smi::FromInt(bufx.has_more() ? GREATER : EQUAL);
+  return (x->IsFlat() && y->IsFlat()) ? FlatStringCompare(x, y)
+                                      : StringInputBufferCompare(x, y);
 }
 
 
 static Object* Runtime_Math_abs(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
+  Counters::math_abs.Increment();
 
   CONVERT_DOUBLE_CHECKED(x, args[0]);
   return Heap::AllocateHeapNumber(fabs(x));
@@ -4509,6 +4860,7 @@ static Object* Runtime_Math_abs(Arguments args) {
 static Object* Runtime_Math_acos(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
+  Counters::math_acos.Increment();
 
   CONVERT_DOUBLE_CHECKED(x, args[0]);
   return TranscendentalCache::Get(TranscendentalCache::ACOS, x);
@@ -4518,6 +4870,7 @@ static Object* Runtime_Math_acos(Arguments args) {
 static Object* Runtime_Math_asin(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
+  Counters::math_asin.Increment();
 
   CONVERT_DOUBLE_CHECKED(x, args[0]);
   return TranscendentalCache::Get(TranscendentalCache::ASIN, x);
@@ -4527,6 +4880,7 @@ static Object* Runtime_Math_asin(Arguments args) {
 static Object* Runtime_Math_atan(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
+  Counters::math_atan.Increment();
 
   CONVERT_DOUBLE_CHECKED(x, args[0]);
   return TranscendentalCache::Get(TranscendentalCache::ATAN, x);
@@ -4536,6 +4890,7 @@ static Object* Runtime_Math_atan(Arguments args) {
 static Object* Runtime_Math_atan2(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
+  Counters::math_atan2.Increment();
 
   CONVERT_DOUBLE_CHECKED(x, args[0]);
   CONVERT_DOUBLE_CHECKED(y, args[1]);
@@ -4559,6 +4914,7 @@ static Object* Runtime_Math_atan2(Arguments args) {
 static Object* Runtime_Math_ceil(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
+  Counters::math_ceil.Increment();
 
   CONVERT_DOUBLE_CHECKED(x, args[0]);
   return Heap::NumberFromDouble(ceiling(x));
@@ -4568,6 +4924,7 @@ static Object* Runtime_Math_ceil(Arguments args) {
 static Object* Runtime_Math_cos(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
+  Counters::math_cos.Increment();
 
   CONVERT_DOUBLE_CHECKED(x, args[0]);
   return TranscendentalCache::Get(TranscendentalCache::COS, x);
@@ -4577,6 +4934,7 @@ static Object* Runtime_Math_cos(Arguments args) {
 static Object* Runtime_Math_exp(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
+  Counters::math_exp.Increment();
 
   CONVERT_DOUBLE_CHECKED(x, args[0]);
   return TranscendentalCache::Get(TranscendentalCache::EXP, x);
@@ -4586,6 +4944,7 @@ static Object* Runtime_Math_exp(Arguments args) {
 static Object* Runtime_Math_floor(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
+  Counters::math_floor.Increment();
 
   CONVERT_DOUBLE_CHECKED(x, args[0]);
   return Heap::NumberFromDouble(floor(x));
@@ -4595,6 +4954,7 @@ static Object* Runtime_Math_floor(Arguments args) {
 static Object* Runtime_Math_log(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
+  Counters::math_log.Increment();
 
   CONVERT_DOUBLE_CHECKED(x, args[0]);
   return TranscendentalCache::Get(TranscendentalCache::LOG, x);
@@ -4635,6 +4995,7 @@ static double powi(double x, int y) {
 static Object* Runtime_Math_pow(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 2);
+  Counters::math_pow.Increment();
 
   CONVERT_DOUBLE_CHECKED(x, args[0]);
 
@@ -4669,10 +5030,27 @@ static Object* Runtime_Math_pow(Arguments args) {
   }
 }
 
+// Fast version of Math.pow if we know that y is not an integer and
+// y is not -0.5 or 0.5. Used as slowcase from codegen.
+static Object* Runtime_Math_pow_cfunction(Arguments args) {
+  NoHandleAllocation ha;
+  ASSERT(args.length() == 2);
+  CONVERT_DOUBLE_CHECKED(x, args[0]);
+  CONVERT_DOUBLE_CHECKED(y, args[1]);
+  if (y == 0) {
+      return Smi::FromInt(1);
+  } else if (isnan(y) || ((x == 1 || x == -1) && isinf(y))) {
+      return Heap::nan_value();
+  } else {
+      return Heap::AllocateHeapNumber(pow(x, y));
+  }
+}
+
 
 static Object* Runtime_Math_round(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
+  Counters::math_round.Increment();
 
   CONVERT_DOUBLE_CHECKED(x, args[0]);
   if (signbit(x) && x >= -0.5) return Heap::minus_zero_value();
@@ -4685,6 +5063,7 @@ static Object* Runtime_Math_round(Arguments args) {
 static Object* Runtime_Math_sin(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
+  Counters::math_sin.Increment();
 
   CONVERT_DOUBLE_CHECKED(x, args[0]);
   return TranscendentalCache::Get(TranscendentalCache::SIN, x);
@@ -4694,6 +5073,7 @@ static Object* Runtime_Math_sin(Arguments args) {
 static Object* Runtime_Math_sqrt(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
+  Counters::math_sqrt.Increment();
 
   CONVERT_DOUBLE_CHECKED(x, args[0]);
   return Heap::AllocateHeapNumber(sqrt(x));
@@ -4703,44 +5083,62 @@ static Object* Runtime_Math_sqrt(Arguments args) {
 static Object* Runtime_Math_tan(Arguments args) {
   NoHandleAllocation ha;
   ASSERT(args.length() == 1);
+  Counters::math_tan.Increment();
 
   CONVERT_DOUBLE_CHECKED(x, args[0]);
   return TranscendentalCache::Get(TranscendentalCache::TAN, x);
 }
 
 
-// The NewArguments function is only used when constructing the
-// arguments array when calling non-functions from JavaScript in
-// runtime.js:CALL_NON_FUNCTION.
-static Object* Runtime_NewArguments(Arguments args) {
+static Object* Runtime_DateMakeDay(Arguments args) {
   NoHandleAllocation ha;
-  ASSERT(args.length() == 1);
+  ASSERT(args.length() == 3);
 
-  // ECMA-262, 3rd., 10.1.8, p.39
-  CONVERT_CHECKED(JSFunction, callee, args[0]);
+  CONVERT_SMI_CHECKED(year, args[0]);
+  CONVERT_SMI_CHECKED(month, args[1]);
+  CONVERT_SMI_CHECKED(date, args[2]);
 
-  // Compute the frame holding the arguments.
-  JavaScriptFrameIterator it;
-  it.AdvanceToArgumentsFrame();
-  JavaScriptFrame* frame = it.frame();
+  static const int day_from_month[] = {0, 31, 59, 90, 120, 151,
+                                       181, 212, 243, 273, 304, 334};
+  static const int day_from_month_leap[] = {0, 31, 60, 91, 121, 152,
+                                            182, 213, 244, 274, 305, 335};
 
-  const int length = frame->GetProvidedParametersCount();
-  Object* result = Heap::AllocateArgumentsObject(callee, length);
-  if (result->IsFailure()) return result;
-  if (length > 0) {
-    Object* obj =  Heap::AllocateFixedArray(length);
-    if (obj->IsFailure()) return obj;
-    FixedArray* array = FixedArray::cast(obj);
-    ASSERT(array->length() == length);
-
-    AssertNoAllocation no_gc;
-    WriteBarrierMode mode = array->GetWriteBarrierMode(no_gc);
-    for (int i = 0; i < length; i++) {
-      array->set(i, frame->GetParameter(i), mode);
-    }
-    JSObject::cast(result)->set_elements(array);
+  year += month / 12;
+  month %= 12;
+  if (month < 0) {
+    year--;
+    month += 12;
   }
-  return result;
+
+  ASSERT(month >= 0);
+  ASSERT(month < 12);
+
+  // year_delta is an arbitrary number such that:
+  // a) year_delta = -1 (mod 400)
+  // b) year + year_delta > 0 for years in the range defined by
+  //    ECMA 262 - 15.9.1.1, i.e. upto 100,000,000 days on either side of
+  //    Jan 1 1970. This is required so that we don't run into integer
+  //    division of negative numbers.
+  // c) there shouldn't be overflow for 32-bit integers in the following
+  //    operations.
+  static const int year_delta = 399999;
+  static const int base_day = 365 * (1970 + year_delta) +
+                              (1970 + year_delta) / 4 -
+                              (1970 + year_delta) / 100 +
+                              (1970 + year_delta) / 400;
+
+  int year1 = year + year_delta;
+  int day_from_year = 365 * year1 +
+                      year1 / 4 -
+                      year1 / 100 +
+                      year1 / 400 -
+                      base_day;
+
+  if (year % 4 || (year % 100 == 0 && year % 400 != 0)) {
+    return Smi::FromInt(day_from_year + day_from_month[month] + date - 1);
+  }
+
+  return Smi::FromInt(day_from_year + day_from_month_leap[month] + date - 1);
 }
 
 
@@ -4790,21 +5188,21 @@ static Object* Runtime_NewClosure(Arguments args) {
 }
 
 
-static Code* ComputeConstructStub(Handle<SharedFunctionInfo> shared) {
-  // TODO(385): Change this to create a construct stub specialized for
-  // the given map to make allocation of simple objects - and maybe
-  // arrays - much faster.
-  if (FLAG_inline_new
-      && shared->has_only_simple_this_property_assignments()) {
+static Code* ComputeConstructStub(Handle<JSFunction> function) {
+  Handle<Object> prototype = Factory::null_value();
+  if (function->has_instance_prototype()) {
+    prototype = Handle<Object>(function->instance_prototype());
+  }
+  if (function->shared()->CanGenerateInlineConstructor(*prototype)) {
     ConstructStubCompiler compiler;
-    Object* code = compiler.CompileConstructStub(*shared);
+    Object* code = compiler.CompileConstructStub(function->shared());
     if (code->IsFailure()) {
       return Builtins::builtin(Builtins::JSConstructStubGeneric);
     }
     return Code::cast(code);
   }
 
-  return shared->construct_stub();
+  return function->shared()->construct_stub();
 }
 
 
@@ -4854,10 +5252,9 @@ static Object* Runtime_NewObject(Arguments args) {
   bool first_allocation = !function->has_initial_map();
   Handle<JSObject> result = Factory::NewJSObject(function);
   if (first_allocation) {
-    Handle<Map> map = Handle<Map>(function->initial_map());
     Handle<Code> stub = Handle<Code>(
-        ComputeConstructStub(Handle<SharedFunctionInfo>(function->shared())));
-    function->shared()->set_construct_stub(*stub);
+        ComputeConstructStub(Handle<JSFunction>(function)));
+    shared->set_construct_stub(*stub);
   }
 
   Counters::constructed_objects.Increment();
@@ -4893,28 +5290,6 @@ static Object* Runtime_LazyCompile(Arguments args) {
   }
 
   return function->code();
-}
-
-
-static Object* Runtime_GetCalledFunction(Arguments args) {
-  HandleScope scope;
-  ASSERT(args.length() == 0);
-  StackFrameIterator it;
-  // Get past the JS-to-C exit frame.
-  ASSERT(it.frame()->is_exit());
-  it.Advance();
-  // Get past the CALL_NON_FUNCTION activation frame.
-  ASSERT(it.frame()->is_java_script());
-  it.Advance();
-  // Argument adaptor frames do not copy the function; we have to skip
-  // past them to get to the real calling frame.
-  if (it.frame()->is_arguments_adaptor()) it.Advance();
-  // Get the function from the top of the expression stack of the
-  // calling frame.
-  StandardFrame* frame = StandardFrame::cast(it.frame());
-  int index = frame->ComputeExpressionsCount() - 1;
-  Object* result = frame->GetExpression(index);
-  return result;
 }
 
 
@@ -5368,6 +5743,7 @@ static Object* Runtime_DebugPrint(Arguments args) {
   }
   args[0]->Print();
   if (args[0]->IsHeapObject()) {
+    PrintF("\n");
     HeapObject::cast(args[0])->map()->Print();
   }
 #else
@@ -7916,26 +8292,217 @@ static Object* Runtime_FunctionGetInferredName(Arguments args) {
   return f->shared()->inferred_name();
 }
 
+
+static int FindSharedFunctionInfosForScript(Script* script,
+                                     FixedArray* buffer) {
+  AssertNoAllocation no_allocations;
+
+  int counter = 0;
+  int buffer_size = buffer->length();
+  HeapIterator iterator;
+  for (HeapObject* obj = iterator.next(); obj != NULL; obj = iterator.next()) {
+    ASSERT(obj != NULL);
+    if (!obj->IsSharedFunctionInfo()) {
+      continue;
+    }
+    SharedFunctionInfo* shared = SharedFunctionInfo::cast(obj);
+    if (shared->script() != script) {
+      continue;
+    }
+    if (counter < buffer_size) {
+      buffer->set(counter, shared);
+    }
+    counter++;
+  }
+  return counter;
+}
+
+// For a script finds all SharedFunctionInfo's in the heap that points
+// to this script. Returns JSArray of SharedFunctionInfo wrapped
+// in OpaqueReferences.
+static Object* Runtime_LiveEditFindSharedFunctionInfosForScript(
+    Arguments args) {
+  ASSERT(args.length() == 1);
+  HandleScope scope;
+  CONVERT_CHECKED(JSValue, script_value, args[0]);
+
+  Handle<Script> script = Handle<Script>(Script::cast(script_value->value()));
+
+  const int kBufferSize = 32;
+
+  Handle<FixedArray> array;
+  array = Factory::NewFixedArray(kBufferSize);
+  int number = FindSharedFunctionInfosForScript(*script, *array);
+  if (number > kBufferSize) {
+    array = Factory::NewFixedArray(number);
+    FindSharedFunctionInfosForScript(*script, *array);
+  }
+
+  Handle<JSArray> result = Factory::NewJSArrayWithElements(array);
+  result->set_length(Smi::FromInt(number));
+
+  LiveEdit::WrapSharedFunctionInfos(result);
+
+  return *result;
+}
+
+// For a script calculates compilation information about all its functions.
+// The script source is explicitly specified by the second argument.
+// The source of the actual script is not used, however it is important that
+// all generated code keeps references to this particular instance of script.
+// Returns a JSArray of compilation infos. The array is ordered so that
+// each function with all its descendant is always stored in a continues range
+// with the function itself going first. The root function is a script function.
+static Object* Runtime_LiveEditGatherCompileInfo(Arguments args) {
+  ASSERT(args.length() == 2);
+  HandleScope scope;
+  CONVERT_CHECKED(JSValue, script, args[0]);
+  CONVERT_ARG_CHECKED(String, source, 1);
+  Handle<Script> script_handle = Handle<Script>(Script::cast(script->value()));
+
+  JSArray* result =  LiveEdit::GatherCompileInfo(script_handle, source);
+
+  if (Top::has_pending_exception()) {
+    return Failure::Exception();
+  }
+
+  return result;
+}
+
+// Changes the source of the script to a new_source and creates a new
+// script representing the old version of the script source.
+static Object* Runtime_LiveEditReplaceScript(Arguments args) {
+  ASSERT(args.length() == 3);
+  HandleScope scope;
+  CONVERT_CHECKED(JSValue, original_script_value, args[0]);
+  CONVERT_ARG_CHECKED(String, new_source, 1);
+  CONVERT_ARG_CHECKED(String, old_script_name, 2);
+  Handle<Script> original_script =
+      Handle<Script>(Script::cast(original_script_value->value()));
+
+  Handle<String> original_source(String::cast(original_script->source()));
+
+  original_script->set_source(*new_source);
+  Handle<Script> old_script = Factory::NewScript(original_source);
+  old_script->set_name(*old_script_name);
+  old_script->set_line_offset(original_script->line_offset());
+  old_script->set_column_offset(original_script->column_offset());
+  old_script->set_data(original_script->data());
+  old_script->set_type(original_script->type());
+  old_script->set_context_data(original_script->context_data());
+  old_script->set_compilation_type(original_script->compilation_type());
+  old_script->set_eval_from_shared(original_script->eval_from_shared());
+  old_script->set_eval_from_instructions_offset(
+      original_script->eval_from_instructions_offset());
+
+
+  Debugger::OnAfterCompile(old_script, Debugger::SEND_WHEN_DEBUGGING);
+
+  return *(GetScriptWrapper(old_script));
+}
+
+// Replaces code of SharedFunctionInfo with a new one.
+static Object* Runtime_LiveEditReplaceFunctionCode(Arguments args) {
+  ASSERT(args.length() == 2);
+  HandleScope scope;
+  CONVERT_ARG_CHECKED(JSArray, new_compile_info, 0);
+  CONVERT_ARG_CHECKED(JSArray, shared_info, 1);
+
+  LiveEdit::ReplaceFunctionCode(new_compile_info, shared_info);
+
+  return Heap::undefined_value();
+}
+
+// Connects SharedFunctionInfo to another script.
+static Object* Runtime_LiveEditRelinkFunctionToScript(Arguments args) {
+  ASSERT(args.length() == 2);
+  HandleScope scope;
+  CONVERT_ARG_CHECKED(JSArray, shared_info_array, 0);
+  CONVERT_ARG_CHECKED(JSValue, script_value, 1);
+  Handle<Script> script = Handle<Script>(Script::cast(script_value->value()));
+
+  LiveEdit::RelinkFunctionToScript(shared_info_array, script);
+
+  return Heap::undefined_value();
+}
+
+// Updates positions of a shared function info (first parameter) according
+// to script source change. Text change is described in second parameter as
+// array of groups of 3 numbers:
+// (change_begin, change_end, change_end_new_position).
+// Each group describes a change in text; groups are sorted by change_begin.
+static Object* Runtime_LiveEditPatchFunctionPositions(Arguments args) {
+  ASSERT(args.length() == 2);
+  HandleScope scope;
+  CONVERT_ARG_CHECKED(JSArray, shared_array, 0);
+  CONVERT_ARG_CHECKED(JSArray, position_change_array, 1);
+
+  LiveEdit::PatchFunctionPositions(shared_array, position_change_array);
+
+  return Heap::undefined_value();
+}
+
+
+static LiveEdit::FunctionPatchabilityStatus FindFunctionCodeOnStacks(
+    Handle<SharedFunctionInfo> shared) {
+  // TODO(635): check all threads, not only the current one.
+  for (StackFrameIterator it; !it.done(); it.Advance()) {
+    StackFrame* frame = it.frame();
+    if (frame->code() == shared->code()) {
+      return LiveEdit::FUNCTION_BLOCKED_ON_STACK;
+    }
+  }
+  return LiveEdit::FUNCTION_AVAILABLE_FOR_PATCH;
+}
+
+// For array of SharedFunctionInfo's (each wrapped in JSValue)
+// checks that none of them have activations on stacks (of any thread).
+// Returns array of the same length with corresponding results of
+// LiveEdit::FunctionPatchabilityStatus type.
+static Object* Runtime_LiveEditCheckStackActivations(Arguments args) {
+  ASSERT(args.length() == 1);
+  HandleScope scope;
+  CONVERT_ARG_CHECKED(JSArray, shared_array, 0);
+
+
+  int len = Smi::cast(shared_array->length())->value();
+  Handle<JSArray> result = Factory::NewJSArray(len);
+
+  for (int i = 0; i < len; i++) {
+    JSValue* wrapper = JSValue::cast(shared_array->GetElement(i));
+    Handle<SharedFunctionInfo> shared(
+        SharedFunctionInfo::cast(wrapper->value()));
+    LiveEdit::FunctionPatchabilityStatus check_res =
+        FindFunctionCodeOnStacks(shared);
+    SetElement(result, i, Handle<Smi>(Smi::FromInt(check_res)));
+  }
+
+  return *result;
+}
+
+
 #endif  // ENABLE_DEBUGGER_SUPPORT
 
 #ifdef ENABLE_LOGGING_AND_PROFILING
 
 static Object* Runtime_ProfilerResume(Arguments args) {
   NoHandleAllocation ha;
-  ASSERT(args.length() == 1);
+  ASSERT(args.length() == 2);
 
   CONVERT_CHECKED(Smi, smi_modules, args[0]);
-  v8::V8::ResumeProfilerEx(smi_modules->value());
+  CONVERT_CHECKED(Smi, smi_tag, args[1]);
+  v8::V8::ResumeProfilerEx(smi_modules->value(), smi_tag->value());
   return Heap::undefined_value();
 }
 
 
 static Object* Runtime_ProfilerPause(Arguments args) {
   NoHandleAllocation ha;
-  ASSERT(args.length() == 1);
+  ASSERT(args.length() == 2);
 
   CONVERT_CHECKED(Smi, smi_modules, args[0]);
-  v8::V8::PauseProfilerEx(smi_modules->value());
+  CONVERT_CHECKED(Smi, smi_tag, args[1]);
+  v8::V8::PauseProfilerEx(smi_modules->value(), smi_tag->value());
   return Heap::undefined_value();
 }
 

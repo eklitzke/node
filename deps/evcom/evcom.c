@@ -1018,6 +1018,11 @@ on_timeout (EV_P_ ev_timer *watcher, int revents)
 
   if (stream->on_timeout) stream->on_timeout(stream);
 
+  // Hack to get error in Node on 'close' event.
+  // should probably be made into a proper error code.
+  stream->errorno = 1;
+
+  ev_timer_stop(EV_A_ watcher);
   evcom_stream_force_close(stream);
 
   if (stream->on_close) stream->on_close(stream);
@@ -1134,12 +1139,13 @@ void evcom_stream_force_close (evcom_stream *stream)
   evcom_stream_detach(stream);
 }
 
-void
+/* Returns the number of bytes flushed to the buffer */
+ssize_t
 evcom_stream_write (evcom_stream *stream, const char *str, size_t len)
 {
   if (!WRITABLE(stream) || GOT_CLOSE(stream)) {
     assert(0 && "Do not write to a closed stream");
-    return;
+    return -1;
   }
 
   ssize_t sent = 0;
@@ -1183,7 +1189,7 @@ evcom_stream_write (evcom_stream *stream, const char *str, size_t len)
   } /* TODO else { memcpy to last buffer on head } */
 
   assert(sent >= 0);
-  if ((size_t)sent == len) return; /* sent the whole buffer */
+  if ((size_t)sent == len) return sent; /* sent the whole buffer */
 
   len -= sent;
   str += sent;
@@ -1197,7 +1203,7 @@ evcom_stream_write (evcom_stream *stream, const char *str, size_t len)
   if (ATTACHED(stream)) {
     ev_io_start(D_LOOP_(stream) &stream->write_watcher);
   }
-  return;
+  return sent;
 
 close:
   stream->send_action = stream_send__close;
@@ -1205,6 +1211,7 @@ close:
   if (ATTACHED(stream)) {
     ev_io_start(D_LOOP_(stream) &stream->write_watcher);
   }
+  return -1;
 }
 
 void

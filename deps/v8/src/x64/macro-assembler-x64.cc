@@ -39,7 +39,6 @@ namespace internal {
 
 MacroAssembler::MacroAssembler(void* buffer, int size)
     : Assembler(buffer, size),
-      unresolved_(0),
       generating_stub_(false),
       allow_stub_calls_(true),
       code_object_(Heap::undefined_value()) {
@@ -387,9 +386,19 @@ void MacroAssembler::CallRuntime(Runtime::Function* f, int num_arguments) {
 }
 
 
-void MacroAssembler::TailCallRuntime(ExternalReference const& ext,
-                                     int num_arguments,
-                                     int result_size) {
+void MacroAssembler::CallExternalReference(const ExternalReference& ext,
+                                           int num_arguments) {
+  movq(rax, Immediate(num_arguments));
+  movq(rbx, ext);
+
+  CEntryStub stub(1);
+  CallStub(&stub);
+}
+
+
+void MacroAssembler::TailCallExternalReference(const ExternalReference& ext,
+                                               int num_arguments,
+                                               int result_size) {
   // ----------- S t a t e -------------
   //  -- rsp[0] : return address
   //  -- rsp[8] : argument num_arguments - 1
@@ -402,12 +411,19 @@ void MacroAssembler::TailCallRuntime(ExternalReference const& ext,
   // should remove this need and make the runtime routine entry code
   // smarter.
   movq(rax, Immediate(num_arguments));
-  JumpToRuntime(ext, result_size);
+  JumpToExternalReference(ext, result_size);
 }
 
 
-void MacroAssembler::JumpToRuntime(const ExternalReference& ext,
-                                   int result_size) {
+void MacroAssembler::TailCallRuntime(Runtime::FunctionId fid,
+                                     int num_arguments,
+                                     int result_size) {
+  TailCallExternalReference(ExternalReference(fid), num_arguments, result_size);
+}
+
+
+void MacroAssembler::JumpToExternalReference(const ExternalReference& ext,
+                                             int result_size) {
   // Set the entry point and jump to the C entry runtime stub.
   movq(rbx, ext);
   CEntryStub ces(result_size);
@@ -415,38 +431,30 @@ void MacroAssembler::JumpToRuntime(const ExternalReference& ext,
 }
 
 
-void MacroAssembler::GetBuiltinEntry(Register target, Builtins::JavaScript id) {
-  bool resolved;
-  Handle<Code> code = ResolveBuiltin(id, &resolved);
+void MacroAssembler::InvokeBuiltin(Builtins::JavaScript id, InvokeFlag flag) {
+  // Calls are not allowed in some stubs.
+  ASSERT(flag == JUMP_FUNCTION || allow_stub_calls());
 
-  const char* name = Builtins::GetName(id);
-  int argc = Builtins::GetArgumentsCount(id);
-
-  movq(target, code, RelocInfo::EMBEDDED_OBJECT);
-  if (!resolved) {
-    uint32_t flags =
-        Bootstrapper::FixupFlagsArgumentsCount::encode(argc) |
-        Bootstrapper::FixupFlagsUseCodeObject::encode(true);
-    Unresolved entry = { pc_offset() - sizeof(intptr_t), flags, name };
-    unresolved_.Add(entry);
-  }
-  addq(target, Immediate(Code::kHeaderSize - kHeapObjectTag));
+  // Rely on the assertion to check that the number of provided
+  // arguments match the expected number of arguments. Fake a
+  // parameter count to avoid emitting code to do the check.
+  ParameterCount expected(0);
+  GetBuiltinEntry(rdx, id);
+  InvokeCode(rdx, expected, expected, flag);
 }
 
-Handle<Code> MacroAssembler::ResolveBuiltin(Builtins::JavaScript id,
-                                            bool* resolved) {
-  // Move the builtin function into the temporary function slot by
-  // reading it from the builtins object. NOTE: We should be able to
-  // reduce this to two instructions by putting the function table in
-  // the global object instead of the "builtins" object and by using a
-  // real register for the function.
-  movq(rdx, Operand(rsi, Context::SlotOffset(Context::GLOBAL_INDEX)));
-  movq(rdx, FieldOperand(rdx, GlobalObject::kBuiltinsOffset));
+
+void MacroAssembler::GetBuiltinEntry(Register target, Builtins::JavaScript id) {
+  // Load the JavaScript builtin function from the builtins object.
+  movq(rdi, Operand(rsi, Context::SlotOffset(Context::GLOBAL_INDEX)));
+  movq(rdi, FieldOperand(rdi, GlobalObject::kBuiltinsOffset));
   int builtins_offset =
       JSBuiltinsObject::kJSBuiltinsOffset + (id * kPointerSize);
-  movq(rdi, FieldOperand(rdx, builtins_offset));
-
-  return Builtins::GetCode(id, resolved);
+  movq(rdi, FieldOperand(rdi, builtins_offset));
+  // Load the code entry point from the function into the target register.
+  movq(target, FieldOperand(rdi, JSFunction::kSharedFunctionInfoOffset));
+  movq(target, FieldOperand(target, SharedFunctionInfo::kCodeOffset));
+  addq(target, Immediate(Code::kHeaderSize - kHeapObjectTag));
 }
 
 
@@ -1392,6 +1400,50 @@ void MacroAssembler::JumpIfNotBothSequentialAsciiStrings(Register first_object,
 }
 
 
+void MacroAssembler::JumpIfInstanceTypeIsNotSequentialAscii(
+    Register instance_type,
+    Register scratch,
+    Label *failure) {
+  if (!scratch.is(instance_type)) {
+    movl(scratch, instance_type);
+  }
+
+  const int kFlatAsciiStringMask =
+      kIsNotStringMask | kStringRepresentationMask | kStringEncodingMask;
+
+  andl(scratch, Immediate(kFlatAsciiStringMask));
+  cmpl(scratch, Immediate(kStringTag | kSeqStringTag | kAsciiStringTag));
+  j(not_equal, failure);
+}
+
+
+void MacroAssembler::JumpIfBothInstanceTypesAreNotSequentialAscii(
+    Register first_object_instance_type,
+    Register second_object_instance_type,
+    Register scratch1,
+    Register scratch2,
+    Label* on_fail) {
+  // Load instance type for both strings.
+  movq(scratch1, first_object_instance_type);
+  movq(scratch2, second_object_instance_type);
+
+  // Check that both are flat ascii strings.
+  ASSERT(kNotStringTag != 0);
+  const int kFlatAsciiStringMask =
+      kIsNotStringMask | kStringRepresentationMask | kStringEncodingMask;
+  const int kFlatAsciiStringTag = ASCII_STRING_TYPE;
+
+  andl(scratch1, Immediate(kFlatAsciiStringMask));
+  andl(scratch2, Immediate(kFlatAsciiStringMask));
+  // Interleave the bits to check both scratch1 and scratch2 in one test.
+  ASSERT_EQ(0, kFlatAsciiStringMask & (kFlatAsciiStringMask << 3));
+  lea(scratch1, Operand(scratch1, scratch2, times_8, 0));
+  cmpl(scratch1,
+       Immediate(kFlatAsciiStringTag + (kFlatAsciiStringTag << 3)));
+  j(not_equal, on_fail);
+}
+
+
 void MacroAssembler::Move(Register dst, Handle<Object> source) {
   ASSERT(!source->IsFailure());
   if (source->IsSmi()) {
@@ -1585,6 +1637,29 @@ void MacroAssembler::CmpInstanceType(Register map, InstanceType type) {
 }
 
 
+void MacroAssembler::CheckMap(Register obj,
+                              Handle<Map> map,
+                              Label* fail,
+                              bool is_heap_object) {
+  if (!is_heap_object) {
+    JumpIfSmi(obj, fail);
+  }
+  Cmp(FieldOperand(obj, HeapObject::kMapOffset), map);
+  j(not_equal, fail);
+}
+
+
+void MacroAssembler::AbortIfNotNumber(Register object, const char* msg) {
+  Label ok;
+  Condition is_smi = CheckSmi(object);
+  j(is_smi, &ok);
+  Cmp(FieldOperand(object, HeapObject::kMapOffset),
+      Factory::heap_number_map());
+  Assert(equal, msg);
+  bind(&ok);
+}
+
+
 Condition MacroAssembler::IsObjectStringType(Register heap_object,
                                              Register map,
                                              Register instance_type) {
@@ -1762,39 +1837,14 @@ void MacroAssembler::CopyRegistersFromStackToMemory(Register base,
   }
 }
 
-#endif  // ENABLE_DEBUGGER_SUPPORT
-
-
-void MacroAssembler::InvokeBuiltin(Builtins::JavaScript id, InvokeFlag flag) {
-  bool resolved;
-  Handle<Code> code = ResolveBuiltin(id, &resolved);
-
-  // Calls are not allowed in some stubs.
-  ASSERT(flag == JUMP_FUNCTION || allow_stub_calls());
-
-  // Rely on the assertion to check that the number of provided
-  // arguments match the expected number of arguments. Fake a
-  // parameter count to avoid emitting code to do the check.
-  ParameterCount expected(0);
-  InvokeCode(Handle<Code>(code),
-             expected,
-             expected,
-             RelocInfo::CODE_TARGET,
-             flag);
-
-  const char* name = Builtins::GetName(id);
-  int argc = Builtins::GetArgumentsCount(id);
-  // The target address for the jump is stored as an immediate at offset
-  // kInvokeCodeAddressOffset.
-  if (!resolved) {
-    uint32_t flags =
-        Bootstrapper::FixupFlagsArgumentsCount::encode(argc) |
-        Bootstrapper::FixupFlagsUseCodeObject::encode(false);
-    Unresolved entry =
-        { pc_offset() - kCallTargetAddressOffset, flags, name };
-    unresolved_.Add(entry);
-  }
+void MacroAssembler::DebugBreak() {
+  ASSERT(allow_stub_calls());
+  xor_(rax, rax);  // no arguments
+  movq(rbx, ExternalReference(Runtime::kDebugBreak));
+  CEntryStub ces(1);
+  Call(ces.GetCode(), RelocInfo::DEBUG_BREAK);
 }
+#endif  // ENABLE_DEBUGGER_SUPPORT
 
 
 void MacroAssembler::InvokePrologue(const ParameterCount& expected,
@@ -1914,6 +1964,21 @@ void MacroAssembler::InvokeFunction(Register function,
 }
 
 
+void MacroAssembler::InvokeFunction(JSFunction* function,
+                                    const ParameterCount& actual,
+                                    InvokeFlag flag) {
+  ASSERT(function->is_compiled());
+  // Get the function and setup the context.
+  Move(rdi, Handle<JSFunction>(function));
+  movq(rsi, FieldOperand(rdi, JSFunction::kContextOffset));
+
+  // Invoke the cached code.
+  Handle<Code> code(function->code());
+  ParameterCount expected(function->shared()->formal_parameter_count());
+  InvokeCode(code, expected, actual, RelocInfo::CODE_TARGET, flag);
+}
+
+
 void MacroAssembler::EnterFrame(StackFrame::Type type) {
   push(rbp);
   movq(rbp, rsp);
@@ -1953,13 +2018,9 @@ void MacroAssembler::EnterExitFrame(ExitFrame::Mode mode, int result_size) {
 
   // Reserve room for entry stack pointer and push the debug marker.
   ASSERT(ExitFrameConstants::kSPOffset == -1 * kPointerSize);
-  push(Immediate(0));  // saved entry sp, patched before call
-  if (mode == ExitFrame::MODE_DEBUG) {
-    push(Immediate(0));
-  } else {
-    movq(kScratchRegister, CodeObject(), RelocInfo::EMBEDDED_OBJECT);
-    push(kScratchRegister);
-  }
+  push(Immediate(0));  // Saved entry sp, patched before call.
+  movq(kScratchRegister, CodeObject(), RelocInfo::EMBEDDED_OBJECT);
+  push(kScratchRegister);  // Accessed from EditFrame::code_slot.
 
   // Save the frame pointer and the context in top.
   ExternalReference c_entry_fp_address(Top::k_c_entry_fp_address);

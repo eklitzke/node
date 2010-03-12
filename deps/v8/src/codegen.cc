@@ -31,6 +31,7 @@
 #include "codegen-inl.h"
 #include "compiler.h"
 #include "debug.h"
+#include "liveedit.h"
 #include "oprofile-agent.h"
 #include "prettyprinter.h"
 #include "register-allocator-inl.h"
@@ -38,9 +39,28 @@
 #include "runtime.h"
 #include "scopeinfo.h"
 #include "stub-cache.h"
+#include "virtual-frame-inl.h"
 
 namespace v8 {
 namespace internal {
+
+#define __ ACCESS_MASM(masm_)
+
+#ifdef DEBUG
+
+Comment::Comment(MacroAssembler* masm, const char* msg)
+    : masm_(masm), msg_(msg) {
+  __ RecordComment(msg);
+}
+
+
+Comment::~Comment() {
+  if (msg_[0] == '[') __ RecordComment("]");
+}
+
+#endif  // DEBUG
+
+#undef __
 
 
 CodeGenerator* CodeGeneratorScope::top_ = NULL;
@@ -126,7 +146,7 @@ void CodeGenerator::DeleteFrame() {
 }
 
 
-void CodeGenerator::MakeCodePrologue(FunctionLiteral* fun) {
+void CodeGenerator::MakeCodePrologue(CompilationInfo* info) {
 #ifdef DEBUG
   bool print_source = false;
   bool print_ast = false;
@@ -147,39 +167,37 @@ void CodeGenerator::MakeCodePrologue(FunctionLiteral* fun) {
 
   if (FLAG_trace_codegen || print_source || print_ast) {
     PrintF("*** Generate code for %s function: ", ftype);
-    fun->name()->ShortPrint();
+    info->function()->name()->ShortPrint();
     PrintF(" ***\n");
   }
 
   if (print_source) {
-    PrintF("--- Source from AST ---\n%s\n", PrettyPrinter().PrintProgram(fun));
+    PrintF("--- Source from AST ---\n%s\n",
+           PrettyPrinter().PrintProgram(info->function()));
   }
 
   if (print_ast) {
-    PrintF("--- AST ---\n%s\n", AstPrinter().PrintProgram(fun));
+    PrintF("--- AST ---\n%s\n",
+           AstPrinter().PrintProgram(info->function()));
   }
 
   if (print_json_ast) {
     JsonAstBuilder builder;
-    PrintF("%s", builder.BuildProgram(fun));
+    PrintF("%s", builder.BuildProgram(info->function()));
   }
 #endif  // DEBUG
 }
 
 
-Handle<Code> CodeGenerator::MakeCodeEpilogue(FunctionLiteral* fun,
-                                             MacroAssembler* masm,
+Handle<Code> CodeGenerator::MakeCodeEpilogue(MacroAssembler* masm,
                                              Code::Flags flags,
-                                             Handle<Script> script) {
+                                             CompilationInfo* info) {
   // Allocate and install the code.
   CodeDesc desc;
   masm->GetCode(&desc);
-  ZoneScopeInfo sinfo(fun->scope());
+  ZoneScopeInfo sinfo(info->scope());
   Handle<Code> code =
       Factory::NewCode(desc, &sinfo, flags, masm->CodeObject());
-
-  // Add unresolved entries in the code to the fixup list.
-  Bootstrapper::AddFixup(*code, masm);
 
 #ifdef ENABLE_DISASSEMBLER
   bool print_code = Bootstrapper::IsActive()
@@ -187,20 +205,23 @@ Handle<Code> CodeGenerator::MakeCodeEpilogue(FunctionLiteral* fun,
       : FLAG_print_code;
   if (print_code) {
     // Print the source code if available.
+    Handle<Script> script = info->script();
+    FunctionLiteral* function = info->function();
     if (!script->IsUndefined() && !script->source()->IsUndefined()) {
       PrintF("--- Raw source ---\n");
       StringInputBuffer stream(String::cast(script->source()));
-      stream.Seek(fun->start_position());
+      stream.Seek(function->start_position());
       // fun->end_position() points to the last character in the stream. We
       // need to compensate by adding one to calculate the length.
-      int source_len = fun->end_position() - fun->start_position() + 1;
+      int source_len =
+          function->end_position() - function->start_position() + 1;
       for (int i = 0; i < source_len; i++) {
         if (stream.has_more()) PrintF("%c", stream.GetNext());
       }
       PrintF("\n\n");
     }
     PrintF("--- Code ---\n");
-    code->Disassemble(*fun->name()->ToCString());
+    code->Disassemble(*function->name()->ToCString());
   }
 #endif  // ENABLE_DISASSEMBLER
 
@@ -214,21 +235,21 @@ Handle<Code> CodeGenerator::MakeCodeEpilogue(FunctionLiteral* fun,
 // Generate the code. Takes a function literal, generates code for it, assemble
 // all the pieces into a Code object. This function is only to be called by
 // the compiler.cc code.
-Handle<Code> CodeGenerator::MakeCode(FunctionLiteral* fun,
-                                     Handle<Script> script,
-                                     bool is_eval,
-                                     CompilationInfo* info) {
+Handle<Code> CodeGenerator::MakeCode(CompilationInfo* info) {
+  LiveEditFunctionTracker live_edit_tracker(info->function());
+  Handle<Script> script = info->script();
   if (!script->IsUndefined() && !script->source()->IsUndefined()) {
     int len = String::cast(script->source())->length();
     Counters::total_old_codegen_source_size.Increment(len);
   }
-  MakeCodePrologue(fun);
+  MakeCodePrologue(info);
   // Generate code.
   const int kInitialBufferSize = 4 * KB;
   MacroAssembler masm(NULL, kInitialBufferSize);
-  CodeGenerator cgen(&masm, script, is_eval);
+  CodeGenerator cgen(&masm);
   CodeGeneratorScope scope(&cgen);
-  cgen.Generate(fun, PRIMARY, info);
+  live_edit_tracker.RecordFunctionScope(info->function()->scope());
+  cgen.Generate(info);
   if (cgen.HasStackOverflow()) {
     ASSERT(!Top::has_pending_exception());
     return Handle<Code>::null();
@@ -236,7 +257,9 @@ Handle<Code> CodeGenerator::MakeCode(FunctionLiteral* fun,
 
   InLoopFlag in_loop = (cgen.loop_nesting() != 0) ? IN_LOOP : NOT_IN_LOOP;
   Code::Flags flags = Code::ComputeFlags(Code::FUNCTION, in_loop);
-  return MakeCodeEpilogue(fun, cgen.masm(), flags, script);
+  Handle<Code> result = MakeCodeEpilogue(cgen.masm(), flags, info);
+  live_edit_tracker.RecordFunctionCode(result);
+  return result;
 }
 
 
@@ -338,6 +361,7 @@ CodeGenerator::InlineRuntimeLUT CodeGenerator::kInlineRuntimeLUT[] = {
   {&CodeGenerator::GenerateIsSmi, "_IsSmi"},
   {&CodeGenerator::GenerateIsNonNegativeSmi, "_IsNonNegativeSmi"},
   {&CodeGenerator::GenerateIsArray, "_IsArray"},
+  {&CodeGenerator::GenerateIsRegExp, "_IsRegExp"},
   {&CodeGenerator::GenerateIsConstructCall, "_IsConstructCall"},
   {&CodeGenerator::GenerateArgumentsLength, "_ArgumentsLength"},
   {&CodeGenerator::GenerateArgumentsAccess, "_Arguments"},
@@ -345,6 +369,7 @@ CodeGenerator::InlineRuntimeLUT CodeGenerator::kInlineRuntimeLUT[] = {
   {&CodeGenerator::GenerateValueOf, "_ValueOf"},
   {&CodeGenerator::GenerateSetValueOf, "_SetValueOf"},
   {&CodeGenerator::GenerateFastCharCodeAt, "_FastCharCodeAt"},
+  {&CodeGenerator::GenerateCharFromCode, "_CharFromCode"},
   {&CodeGenerator::GenerateObjectEquals, "_ObjectEquals"},
   {&CodeGenerator::GenerateLog, "_Log"},
   {&CodeGenerator::GenerateRandomPositiveSmi, "_RandomPositiveSmi"},
@@ -355,6 +380,11 @@ CodeGenerator::InlineRuntimeLUT CodeGenerator::kInlineRuntimeLUT[] = {
   {&CodeGenerator::GenerateSubString, "_SubString"},
   {&CodeGenerator::GenerateStringCompare, "_StringCompare"},
   {&CodeGenerator::GenerateRegExpExec, "_RegExpExec"},
+  {&CodeGenerator::GenerateNumberToString, "_NumberToString"},
+  {&CodeGenerator::GenerateMathPow, "_Math_pow"},
+  {&CodeGenerator::GenerateMathSin, "_Math_sin"},
+  {&CodeGenerator::GenerateMathCos, "_Math_cos"},
+  {&CodeGenerator::GenerateMathSqrt, "_Math_sqrt"},
 };
 
 
@@ -503,12 +533,6 @@ bool ApiGetterEntryStub::GetCustomCache(Code** code_out) {
 
 void ApiGetterEntryStub::SetCustomCache(Code* value) {
   info()->set_load_stub_cache(value);
-}
-
-
-void DebuggerStatementStub::Generate(MacroAssembler* masm) {
-  Runtime::Function* f = Runtime::FunctionForId(Runtime::kDebugBreak);
-  masm->TailCallRuntime(ExternalReference(f), 0, f->result_size);
 }
 
 

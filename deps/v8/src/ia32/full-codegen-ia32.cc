@@ -32,6 +32,7 @@
 #include "debug.h"
 #include "full-codegen.h"
 #include "parser.h"
+#include "scopes.h"
 
 namespace v8 {
 namespace internal {
@@ -51,9 +52,11 @@ namespace internal {
 //
 // The function builds a JS frame.  Please see JavaScriptFrameConstants in
 // frames-ia32.h for its layout.
-void FullCodeGenerator::Generate(FunctionLiteral* fun, Mode mode) {
-  function_ = fun;
-  SetFunctionPosition(fun);
+void FullCodeGenerator::Generate(CompilationInfo* info, Mode mode) {
+  ASSERT(info_ == NULL);
+  info_ = info;
+  SetFunctionPosition(function());
+  Comment cmnt(masm_, "[ function compiled by full code generator");
 
   if (mode == PRIMARY) {
     __ push(ebp);  // Caller's frame pointer.
@@ -62,7 +65,7 @@ void FullCodeGenerator::Generate(FunctionLiteral* fun, Mode mode) {
     __ push(edi);  // Callee's JS Function.
 
     { Comment cmnt(masm_, "[ Allocate locals");
-      int locals_count = fun->scope()->num_stack_slots();
+      int locals_count = scope()->num_stack_slots();
       if (locals_count == 1) {
         __ push(Immediate(Factory::undefined_value()));
       } else if (locals_count > 1) {
@@ -76,7 +79,7 @@ void FullCodeGenerator::Generate(FunctionLiteral* fun, Mode mode) {
     bool function_in_register = true;
 
     // Possibly allocate a local context.
-    if (fun->scope()->num_heap_slots() > 0) {
+    if (scope()->num_heap_slots() > 0) {
       Comment cmnt(masm_, "[ Allocate local context");
       // Argument to NewContext is the function, which is still in edi.
       __ push(edi);
@@ -87,9 +90,9 @@ void FullCodeGenerator::Generate(FunctionLiteral* fun, Mode mode) {
       __ mov(Operand(ebp, StandardFrameConstants::kContextOffset), esi);
 
       // Copy parameters into context if necessary.
-      int num_parameters = fun->scope()->num_parameters();
+      int num_parameters = scope()->num_parameters();
       for (int i = 0; i < num_parameters; i++) {
-        Slot* slot = fun->scope()->parameter(i)->slot();
+        Slot* slot = scope()->parameter(i)->slot();
         if (slot != NULL && slot->type() == Slot::CONTEXT) {
           int parameter_offset = StandardFrameConstants::kCallerSPOffset +
                                      (num_parameters - 1 - i) * kPointerSize;
@@ -107,7 +110,7 @@ void FullCodeGenerator::Generate(FunctionLiteral* fun, Mode mode) {
       }
     }
 
-    Variable* arguments = fun->scope()->arguments()->AsVariable();
+    Variable* arguments = scope()->arguments()->AsVariable();
     if (arguments != NULL) {
       // Function uses arguments object.
       Comment cmnt(masm_, "[ Allocate arguments object");
@@ -117,10 +120,11 @@ void FullCodeGenerator::Generate(FunctionLiteral* fun, Mode mode) {
         __ push(Operand(ebp, JavaScriptFrameConstants::kFunctionOffset));
       }
       // Receiver is just before the parameters on the caller's stack.
-      __ lea(edx, Operand(ebp, StandardFrameConstants::kCallerSPOffset +
-                          fun->num_parameters() * kPointerSize));
+      int offset = scope()->num_parameters() * kPointerSize;
+      __ lea(edx,
+             Operand(ebp, StandardFrameConstants::kCallerSPOffset + offset));
       __ push(edx);
-      __ push(Immediate(Smi::FromInt(fun->num_parameters())));
+      __ push(Immediate(Smi::FromInt(scope()->num_parameters())));
       // Arguments to ArgumentsAccessStub:
       //   function, receiver address, parameter count.
       // The stub will rewrite receiver and parameter count if the previous
@@ -130,13 +134,13 @@ void FullCodeGenerator::Generate(FunctionLiteral* fun, Mode mode) {
       __ mov(ecx, eax);  // Duplicate result.
       Move(arguments->slot(), eax, ebx, edx);
       Slot* dot_arguments_slot =
-          fun->scope()->arguments_shadow()->AsVariable()->slot();
+          scope()->arguments_shadow()->AsVariable()->slot();
       Move(dot_arguments_slot, ecx, ebx, edx);
     }
   }
 
   { Comment cmnt(masm_, "[ Declarations");
-    VisitDeclarations(fun->scope()->declarations());
+    VisitDeclarations(scope()->declarations());
   }
 
   { Comment cmnt(masm_, "[ Stack check");
@@ -156,14 +160,14 @@ void FullCodeGenerator::Generate(FunctionLiteral* fun, Mode mode) {
 
   { Comment cmnt(masm_, "[ Body");
     ASSERT(loop_depth() == 0);
-    VisitStatements(fun->body());
+    VisitStatements(function()->body());
     ASSERT(loop_depth() == 0);
   }
 
   { Comment cmnt(masm_, "[ return <undefined>;");
     // Emit a 'return undefined' in case control fell off the end of the body.
     __ mov(eax, Factory::undefined_value());
-    EmitReturnSequence(function_->end_position());
+    EmitReturnSequence(function()->end_position());
   }
 }
 
@@ -190,7 +194,7 @@ void FullCodeGenerator::EmitReturnSequence(int position) {
     // patch with the code required by the debugger.
     __ mov(esp, ebp);
     __ pop(ebp);
-    __ ret((function_->scope()->num_parameters() + 1) * kPointerSize);
+    __ ret((scope()->num_parameters() + 1) * kPointerSize);
 #ifdef ENABLE_DEBUGGER_SUPPORT
     // Check that the size of the code used for returning matches what is
     // expected by the debugger.
@@ -627,7 +631,7 @@ MemOperand FullCodeGenerator::EmitSlotSearch(Slot* slot, Register scratch) {
       return Operand(ebp, SlotOffset(slot));
     case Slot::CONTEXT: {
       int context_chain_length =
-          function_->scope()->ContextChainLength(slot->var()->scope());
+          scope()->ContextChainLength(slot->var()->scope());
       __ LoadContext(scratch, context_chain_length);
       return CodeGenerator::ContextOperand(scratch, slot->index());
     }
@@ -686,7 +690,7 @@ void FullCodeGenerator::VisitDeclaration(Declaration* decl) {
         // this specific context.
 
         // The variable in the decl always resides in the current context.
-        ASSERT_EQ(0, function_->scope()->ContextChainLength(var->scope()));
+        ASSERT_EQ(0, scope()->ContextChainLength(var->scope()));
         if (FLAG_debug_code) {
           // Check if we have the correct context pointer.
           __ mov(ebx,
@@ -738,23 +742,22 @@ void FullCodeGenerator::VisitDeclaration(Declaration* decl) {
       // We are declaring a function or constant that rewrites to a
       // property.  Use (keyed) IC to set the initial value.
       VisitForValue(prop->obj(), kStack);
-      VisitForValue(prop->key(), kStack);
-
       if (decl->fun() != NULL) {
+        VisitForValue(prop->key(), kStack);
         VisitForValue(decl->fun(), kAccumulator);
+        __ pop(ecx);
       } else {
+        VisitForValue(prop->key(), kAccumulator);
+        __ mov(ecx, result_register());
         __ mov(result_register(), Factory::the_hole_value());
       }
+      __ pop(edx);
 
       Handle<Code> ic(Builtins::builtin(Builtins::KeyedStoreIC_Initialize));
       __ call(ic, RelocInfo::CODE_TARGET);
       // Absence of a test eax instruction following the call
       // indicates that none of the load was inlined.
       __ nop();
-
-      // Value in eax is ignored (declarations are statements).  Receiver
-      // and key on stack are discarded.
-      __ Drop(2);
     }
   }
 }
@@ -764,7 +767,7 @@ void FullCodeGenerator::DeclareGlobals(Handle<FixedArray> pairs) {
   // Call the runtime to declare the globals.
   __ push(esi);  // The context is the first argument.
   __ push(Immediate(pairs));
-  __ push(Immediate(Smi::FromInt(is_eval_ ? 1 : 0)));
+  __ push(Immediate(Smi::FromInt(is_eval() ? 1 : 0)));
   __ CallRuntime(Runtime::kDeclareGlobals, 3);
   // Return value is ignored.
 }
@@ -775,7 +778,7 @@ void FullCodeGenerator::VisitFunctionLiteral(FunctionLiteral* expr) {
 
   // Build the function boilerplate and instantiate it.
   Handle<JSFunction> boilerplate =
-      Compiler::BuildBoilerplate(expr, script_, this);
+      Compiler::BuildBoilerplate(expr, script(), this);
   if (HasStackOverflow()) return;
 
   ASSERT(boilerplate->IsBoilerplate());
@@ -806,7 +809,7 @@ void FullCodeGenerator::EmitVariableLoad(Variable* var,
     Comment cmnt(masm_, "Global variable");
     // Use inline caching. Variable name is passed in ecx and the global
     // object on the stack.
-    __ push(CodeGenerator::GlobalObject());
+    __ mov(eax, CodeGenerator::GlobalObject());
     __ mov(ecx, var->name());
     Handle<Code> ic(Builtins::builtin(Builtins::LoadIC_Initialize));
     __ call(ic, RelocInfo::CODE_TARGET_CONTEXT);
@@ -815,7 +818,7 @@ void FullCodeGenerator::EmitVariableLoad(Variable* var,
     // Remember that the assembler may choose to do peephole optimization
     // (eg, push/pop elimination).
     __ nop();
-    DropAndApply(1, context, eax);
+    Apply(context, eax);
 
   } else if (slot != NULL && slot->type() == Slot::LOOKUP) {
     Comment cmnt(masm_, "Lookup slot");
@@ -843,7 +846,7 @@ void FullCodeGenerator::EmitVariableLoad(Variable* var,
 
     // Load the object.
     MemOperand object_loc = EmitSlotSearch(object_slot, eax);
-    __ push(object_loc);
+    __ mov(edx, object_loc);
 
     // Assert that the key is a smi.
     Literal* key_literal = property->key()->AsLiteral();
@@ -851,7 +854,7 @@ void FullCodeGenerator::EmitVariableLoad(Variable* var,
     ASSERT(key_literal->handle()->IsSmi());
 
     // Load the key.
-    __ push(Immediate(key_literal->handle()));
+    __ mov(eax, Immediate(key_literal->handle()));
 
     // Do a keyed property load.
     Handle<Code> ic(Builtins::builtin(Builtins::KeyedLoadIC_Initialize));
@@ -860,7 +863,7 @@ void FullCodeGenerator::EmitVariableLoad(Variable* var,
     // call. It is treated specially by the LoadIC code.
     __ nop();
     // Drop key and object left on the stack by IC.
-    DropAndApply(2, context, eax);
+    Apply(context, eax);
   }
 }
 
@@ -1011,6 +1014,99 @@ void FullCodeGenerator::VisitArrayLiteral(ArrayLiteral* expr) {
 }
 
 
+void FullCodeGenerator::VisitAssignment(Assignment* expr) {
+  Comment cmnt(masm_, "[ Assignment");
+  ASSERT(expr->op() != Token::INIT_CONST);
+  // Left-hand side can only be a property, a global or a (parameter or local)
+  // slot. Variables with rewrite to .arguments are treated as KEYED_PROPERTY.
+  enum LhsKind { VARIABLE, NAMED_PROPERTY, KEYED_PROPERTY };
+  LhsKind assign_type = VARIABLE;
+  Property* prop = expr->target()->AsProperty();
+  if (prop != NULL) {
+    assign_type =
+        (prop->key()->IsPropertyName()) ? NAMED_PROPERTY : KEYED_PROPERTY;
+  }
+
+  // Evaluate LHS expression.
+  switch (assign_type) {
+    case VARIABLE:
+      // Nothing to do here.
+      break;
+    case NAMED_PROPERTY:
+      if (expr->is_compound()) {
+        // We need the receiver both on the stack and in the accumulator.
+        VisitForValue(prop->obj(), kAccumulator);
+        __ push(result_register());
+      } else {
+        VisitForValue(prop->obj(), kStack);
+      }
+      break;
+    case KEYED_PROPERTY:
+      if (expr->is_compound()) {
+        VisitForValue(prop->obj(), kStack);
+        VisitForValue(prop->key(), kAccumulator);
+        __ mov(edx, Operand(esp, 0));
+        __ push(eax);
+      } else {
+        VisitForValue(prop->obj(), kStack);
+        VisitForValue(prop->key(), kStack);
+      }
+      break;
+  }
+
+  // If we have a compound assignment: Get value of LHS expression and
+  // store in on top of the stack.
+  if (expr->is_compound()) {
+    Location saved_location = location_;
+    location_ = kStack;
+    switch (assign_type) {
+      case VARIABLE:
+        EmitVariableLoad(expr->target()->AsVariableProxy()->var(),
+                         Expression::kValue);
+        break;
+      case NAMED_PROPERTY:
+        EmitNamedPropertyLoad(prop);
+        __ push(result_register());
+        break;
+      case KEYED_PROPERTY:
+        EmitKeyedPropertyLoad(prop);
+        __ push(result_register());
+        break;
+    }
+    location_ = saved_location;
+  }
+
+  // Evaluate RHS expression.
+  Expression* rhs = expr->value();
+  VisitForValue(rhs, kAccumulator);
+
+  // If we have a compound assignment: Apply operator.
+  if (expr->is_compound()) {
+    Location saved_location = location_;
+    location_ = kAccumulator;
+    EmitBinaryOp(expr->binary_op(), Expression::kValue);
+    location_ = saved_location;
+  }
+
+  // Record source position before possible IC call.
+  SetSourcePosition(expr->position());
+
+  // Store the value.
+  switch (assign_type) {
+    case VARIABLE:
+      EmitVariableAssignment(expr->target()->AsVariableProxy()->var(),
+                             context_);
+      break;
+    case NAMED_PROPERTY:
+      EmitNamedPropertyAssignment(expr);
+      break;
+    case KEYED_PROPERTY:
+      EmitKeyedPropertyAssignment(expr);
+      break;
+  }
+}
+
+
 void FullCodeGenerator::EmitNamedPropertyLoad(Property* prop) {
   SetSourcePosition(prop->position());
   Literal* key = prop->key()->AsLiteral();
@@ -1034,7 +1130,8 @@ void FullCodeGenerator::EmitBinaryOp(Token::Value op,
   __ push(result_register());
   GenericBinaryOpStub stub(op,
                            NO_OVERWRITE,
-                           NO_GENERIC_BINARY_FLAGS);
+                           NO_GENERIC_BINARY_FLAGS,
+                           NumberInfo::Unknown());
   __ CallStub(&stub);
   Apply(context, eax);
 }
@@ -1155,6 +1252,12 @@ void FullCodeGenerator::EmitKeyedPropertyAssignment(Assignment* expr) {
     __ pop(result_register());
   }
 
+  __ pop(ecx);
+  if (expr->ends_initialization_block()) {
+    __ mov(edx, Operand(esp, 0));  // Leave receiver on the stack for later.
+  } else {
+    __ pop(edx);
+  }
   // Record source code position before IC call.
   SetSourcePosition(expr->position());
   Handle<Code> ic(Builtins::builtin(Builtins::KeyedStoreIC_Initialize));
@@ -1165,15 +1268,14 @@ void FullCodeGenerator::EmitKeyedPropertyAssignment(Assignment* expr) {
 
   // If the assignment ends an initialization block, revert to fast case.
   if (expr->ends_initialization_block()) {
+    __ pop(edx);
     __ push(eax);  // Result of assignment, saved even if not needed.
-    // Receiver is under the key and value.
-    __ push(Operand(esp, 2 * kPointerSize));
+    __ push(edx);
     __ CallRuntime(Runtime::kToFastProperties, 1);
     __ pop(eax);
   }
 
-  // Receiver and key are still on stack.
-  DropAndApply(2, context_, eax);
+  Apply(context_, eax);
 }
 
 
@@ -1181,18 +1283,16 @@ void FullCodeGenerator::VisitProperty(Property* expr) {
   Comment cmnt(masm_, "[ Property");
   Expression* key = expr->key();
 
-  // Evaluate the receiver.
-  VisitForValue(expr->obj(), kStack);
-
   if (key->IsPropertyName()) {
+    VisitForValue(expr->obj(), kAccumulator);
     EmitNamedPropertyLoad(expr);
-    // Drop receiver left on the stack by IC.
-    DropAndApply(1, context_, eax);
+    Apply(context_, eax);
   } else {
-    VisitForValue(expr->key(), kStack);
+    VisitForValue(expr->obj(), kStack);
+    VisitForValue(expr->key(), kAccumulator);
+    __ pop(edx);
     EmitKeyedPropertyLoad(expr);
-    // Drop key and receiver left on the stack by IC.
-    DropAndApply(2, context_, eax);
+    Apply(context_, eax);
   }
 }
 
@@ -1263,25 +1363,31 @@ void FullCodeGenerator::VisitCall(Call* expr) {
       // Call to a keyed property, use keyed load IC followed by function
       // call.
       VisitForValue(prop->obj(), kStack);
-      VisitForValue(prop->key(), kStack);
+      VisitForValue(prop->key(), kAccumulator);
       // Record source code position for IC call.
       SetSourcePosition(prop->position());
+      if (prop->is_synthetic()) {
+        __ pop(edx);  // We do not need to keep the receiver.
+      } else {
+        __ mov(edx, Operand(esp, 0));  // Keep receiver, to call function on.
+      }
+
       Handle<Code> ic(Builtins::builtin(Builtins::KeyedLoadIC_Initialize));
       __ call(ic, RelocInfo::CODE_TARGET);
       // By emitting a nop we make sure that we do not have a "test eax,..."
       // instruction after the call it is treated specially by the LoadIC code.
       __ nop();
-      // Drop key left on the stack by IC.
-      __ Drop(1);
-      // Pop receiver.
-      __ pop(ebx);
-      // Push result (function).
-      __ push(eax);
-      // Push receiver object on stack.
       if (prop->is_synthetic()) {
+        // Push result (function).
+        __ push(eax);
+        // Push Global receiver.
         __ mov(ecx, CodeGenerator::GlobalObject());
         __ push(FieldOperand(ecx, GlobalObject::kGlobalReceiverOffset));
       } else {
+        // Pop receiver.
+        __ pop(ebx);
+        // Push result (function).
+        __ push(eax);
         __ push(ebx);
       }
       EmitCallWithStub(expr);
@@ -1453,13 +1559,13 @@ void FullCodeGenerator::VisitUnaryOperation(UnaryOperation* expr) {
           !proxy->var()->is_this() &&
           proxy->var()->is_global()) {
         Comment cmnt(masm_, "Global variable");
-        __ push(CodeGenerator::GlobalObject());
+        __ mov(eax, CodeGenerator::GlobalObject());
         __ mov(ecx, Immediate(proxy->name()));
         Handle<Code> ic(Builtins::builtin(Builtins::LoadIC_Initialize));
         // Use a regular load, not a contextual load, to avoid a reference
         // error.
         __ call(ic, RelocInfo::CODE_TARGET);
-        __ mov(Operand(esp, 0), eax);
+        __ push(eax);
       } else if (proxy != NULL &&
                  proxy->var()->slot() != NULL &&
                  proxy->var()->slot()->type() == Slot::LOOKUP) {
@@ -1563,11 +1669,16 @@ void FullCodeGenerator::VisitCountOperation(CountOperation* expr) {
     if (expr->is_postfix() && context_ != Expression::kEffect) {
       __ push(Immediate(Smi::FromInt(0)));
     }
-    VisitForValue(prop->obj(), kStack);
     if (assign_type == NAMED_PROPERTY) {
+      // Put the object both on the stack and in the accumulator.
+      VisitForValue(prop->obj(), kAccumulator);
+      __ push(eax);
       EmitNamedPropertyLoad(prop);
     } else {
-      VisitForValue(prop->key(), kStack);
+      VisitForValue(prop->obj(), kStack);
+      VisitForValue(prop->key(), kAccumulator);
+      __ mov(edx, Operand(esp, 0));
+      __ push(eax);
       EmitKeyedPropertyLoad(prop);
     }
   }
@@ -1634,7 +1745,8 @@ void FullCodeGenerator::VisitCountOperation(CountOperation* expr) {
   // Call stub for +1/-1.
   GenericBinaryOpStub stub(expr->binary_op(),
                            NO_OVERWRITE,
-                           NO_GENERIC_BINARY_FLAGS);
+                           NO_GENERIC_BINARY_FLAGS,
+                           NumberInfo::Unknown());
   stub.GenerateCall(masm(), eax, Smi::FromInt(1));
   __ bind(&done);
 
@@ -1672,18 +1784,20 @@ void FullCodeGenerator::VisitCountOperation(CountOperation* expr) {
       break;
     }
     case KEYED_PROPERTY: {
+      __ pop(ecx);
+      __ pop(edx);
       Handle<Code> ic(Builtins::builtin(Builtins::KeyedStoreIC_Initialize));
       __ call(ic, RelocInfo::CODE_TARGET);
       // This nop signals to the IC that there is no inlined code at the call
       // site for it to patch.
       __ nop();
       if (expr->is_postfix()) {
-        __ Drop(2);  // Result is on the stack under the key and the receiver.
+        // Result is on the stack
         if (context_ != Expression::kEffect) {
           ApplyTOS(context_);
         }
       } else {
-        DropAndApply(2, context_, eax);
+        Apply(context_, eax);
       }
       break;
     }

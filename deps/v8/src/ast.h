@@ -1,4 +1,4 @@
-// Copyright 2006-2008 the V8 project authors. All rights reserved.
+// Copyright 2010 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -102,6 +102,7 @@ namespace internal {
 // Forward declarations
 class TargetCollector;
 class MaterializedLiteral;
+class DefinitionInfo;
 
 #define DEF_FORWARD_DECLARATION(type) class type;
 AST_NODE_LIST(DEF_FORWARD_DECLARATION)
@@ -116,6 +117,9 @@ typedef ZoneList<Handle<Object> > ZoneObjectList;
 
 class AstNode: public ZoneObject {
  public:
+  static const int kNoNumber = -1;
+
+  AstNode() : num_(kNoNumber) {}
   virtual ~AstNode() { }
   virtual void Accept(AstVisitor* v) = 0;
 
@@ -140,6 +144,13 @@ class AstNode: public ZoneObject {
   virtual ObjectLiteral* AsObjectLiteral() { return NULL; }
   virtual ArrayLiteral* AsArrayLiteral() { return NULL; }
   virtual CompareOperation* AsCompareOperation() { return NULL; }
+
+  int num() { return num_; }
+  void set_num(int n) { num_ = n; }
+
+ private:
+  // Support for ast node numbering.
+  int num_;
 };
 
 
@@ -180,9 +191,10 @@ class Expression: public AstNode {
     kTestValue
   };
 
-  static const int kNoLabel = -1;
-
-  Expression() : num_(kNoLabel) {}
+  Expression()
+      : bitfields_(0),
+        def_(NULL),
+        defined_vars_(NULL) {}
 
   virtual Expression* AsExpression()  { return this; }
 
@@ -193,6 +205,15 @@ class Expression: public AstNode {
   // names because [] for string objects is handled only by keyed ICs.
   virtual bool IsPropertyName() { return false; }
 
+  // True if the expression does not have (evaluated) subexpressions.
+  // Function literals are leaves because their subexpressions are not
+  // evaluated.
+  virtual bool IsLeaf() { return false; }
+
+  // True if the expression has no side effects and is safe to
+  // evaluate out of order.
+  virtual bool IsTrivial() { return false; }
+
   // Mark the expression as being compiled as an expression
   // statement. This is used to transform postfix increments to
   // (faster) prefix increments.
@@ -201,14 +222,45 @@ class Expression: public AstNode {
   // Static type information for this expression.
   StaticType* type() { return &type_; }
 
-  int num() { return num_; }
+  // Data flow information.
+  DefinitionInfo* var_def() { return def_; }
+  void set_var_def(DefinitionInfo* def) { def_ = def; }
 
-  // AST node numbering ordered by evaluation order.
-  void set_num(int n) { num_ = n; }
+  ZoneList<DefinitionInfo*>* defined_vars() { return defined_vars_; }
+  void set_defined_vars(ZoneList<DefinitionInfo*>* defined_vars) {
+    defined_vars_ = defined_vars;
+  }
+
+  // AST analysis results
+
+  // True if the expression rooted at this node can be compiled by the
+  // side-effect free compiler.
+  bool side_effect_free() { return SideEffectFreeField::decode(bitfields_); }
+  void set_side_effect_free(bool is_side_effect_free) {
+    bitfields_ &= ~SideEffectFreeField::mask();
+    bitfields_ |= SideEffectFreeField::encode(is_side_effect_free);
+  }
+
+  // Will ToInt32 (ECMA 262-3 9.5) or ToUint32 (ECMA 262-3 9.6)
+  // be applied to the value of this expression?
+  // If so, we may be able to optimize the calculation of the value.
+  bool to_int32() { return ToInt32Field::decode(bitfields_); }
+  void set_to_int32(bool to_int32) {
+    bitfields_ &= ~ToInt32Field::mask();
+    bitfields_ |= ToInt32Field::encode(to_int32);
+  }
+
 
  private:
+  uint32_t bitfields_;
   StaticType type_;
-  int num_;
+
+  DefinitionInfo* def_;
+  ZoneList<DefinitionInfo*>* defined_vars_;
+
+  // Using template BitField<type, start, size>.
+  class SideEffectFreeField : public BitField<bool, 0, 1> {};
+  class ToInt32Field : public BitField<bool, 1, 1> {};
 };
 
 
@@ -720,6 +772,9 @@ class Literal: public Expression {
     return false;
   }
 
+  virtual bool IsLeaf() { return true; }
+  virtual bool IsTrivial() { return true; }
+
   // Identity testers.
   bool IsNull() const { return handle_.is_identical_to(Factory::null_value()); }
   bool IsTrue() const { return handle_.is_identical_to(Factory::true_value()); }
@@ -802,6 +857,8 @@ class ObjectLiteral: public MaterializedLiteral {
   virtual ObjectLiteral* AsObjectLiteral() { return this; }
   virtual void Accept(AstVisitor* v);
 
+  virtual bool IsLeaf() { return properties()->is_empty(); }
+
   Handle<FixedArray> constant_properties() const {
     return constant_properties_;
   }
@@ -824,6 +881,8 @@ class RegExpLiteral: public MaterializedLiteral {
         flags_(flags) {}
 
   virtual void Accept(AstVisitor* v);
+
+  virtual bool IsLeaf() { return true; }
 
   Handle<String> pattern() const { return pattern_; }
   Handle<String> flags() const { return flags_; }
@@ -848,6 +907,8 @@ class ArrayLiteral: public MaterializedLiteral {
 
   virtual void Accept(AstVisitor* v);
   virtual ArrayLiteral* AsArrayLiteral() { return this; }
+
+  virtual bool IsLeaf() { return values()->is_empty(); }
 
   Handle<FixedArray> constant_elements() const { return constant_elements_; }
   ZoneList<Expression*>* values() const { return values_; }
@@ -896,6 +957,15 @@ class VariableProxy: public Expression {
     return var_ == NULL ? true : var_->IsValidLeftHandSide();
   }
 
+  virtual bool IsLeaf() {
+    ASSERT(var_ != NULL);  // Variable must be resolved.
+    return var()->is_global() || var()->rewrite()->IsLeaf();
+  }
+
+  // Reading from a mutable variable is a side effect, but 'this' is
+  // immutable.
+  virtual bool IsTrivial() { return is_this(); }
+
   bool IsVariable(Handle<String> n) {
     return !is_this() && name().is_identical_to(n);
   }
@@ -907,8 +977,6 @@ class VariableProxy: public Expression {
 
   Handle<String> name() const  { return name_; }
   Variable* var() const  { return var_; }
-  UseCount* var_uses()  { return &var_uses_; }
-  UseCount* obj_uses()  { return &obj_uses_; }
   bool is_this() const  { return is_this_; }
   bool inside_with() const  { return inside_with_; }
 
@@ -920,10 +988,6 @@ class VariableProxy: public Expression {
   Variable* var_;  // resolved variable, or NULL
   bool is_this_;
   bool inside_with_;
-
-  // VariableProxy usage info.
-  UseCount var_uses_;  // uses of the variable value
-  UseCount obj_uses_;  // uses of the object the variable points to
 
   VariableProxy(Handle<String> name, bool is_this, bool inside_with);
   explicit VariableProxy(bool is_this);
@@ -980,6 +1044,10 @@ class Slot: public Expression {
 
   // Type testing & conversion
   virtual Slot* AsSlot() { return this; }
+
+  virtual bool IsLeaf() { return true; }
+
+  bool IsStackAllocated() { return type_ == PARAMETER || type_ == LOCAL; }
 
   // Accessors
   Variable* var() const { return var_; }
@@ -1337,6 +1405,8 @@ class FunctionLiteral: public Expression {
   // Type testing & conversion
   virtual FunctionLiteral* AsFunctionLiteral()  { return this; }
 
+  virtual bool IsLeaf() { return true; }
+
   Handle<String> name() const  { return name_; }
   Scope* scope() const  { return scope_; }
   ZoneList<Statement*>* body() const  { return body_; }
@@ -1403,6 +1473,8 @@ class FunctionBoilerplateLiteral: public Expression {
 
   Handle<JSFunction> boilerplate() const { return boilerplate_; }
 
+  virtual bool IsLeaf() { return true; }
+
   virtual void Accept(AstVisitor* v);
 
  private:
@@ -1413,6 +1485,7 @@ class FunctionBoilerplateLiteral: public Expression {
 class ThisFunction: public Expression {
  public:
   virtual void Accept(AstVisitor* v);
+  virtual bool IsLeaf() { return true; }
 };
 
 

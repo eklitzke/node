@@ -73,7 +73,21 @@ const kDayMask            = 0x01f;
 const kYearShift          = 9;
 const kMonthShift         = 5;
 
+# Limits for parts of the date, so that we support all the dates that
+# ECMA 262 - 15.9.1.1 requires us to, but at the same time be sure that
+# the date (days since 1970) is in SMI range.
+const kMinYear  = -1000000;
+const kMaxYear  = 1000000;
+const kMinMonth = -10000000;
+const kMaxMonth = 10000000;
+const kMinDate  = -100000000;
+const kMaxDate  = 100000000;
+
 # Type query macros.
+#
+# Note: We have special support for typeof(foo) === 'bar' in the compiler.
+#       It will *not* generate a runtime typeof call for the most important
+#       values of 'bar'.
 macro IS_NULL(arg)              = (arg === null);
 macro IS_NULL_OR_UNDEFINED(arg) = (arg == null);
 macro IS_UNDEFINED(arg)         = (typeof(arg) === 'undefined');
@@ -83,7 +97,7 @@ macro IS_BOOLEAN(arg)           = (typeof(arg) === 'boolean');
 macro IS_OBJECT(arg)            = (%_IsObject(arg));
 macro IS_ARRAY(arg)             = (%_IsArray(arg));
 macro IS_FUNCTION(arg)          = (%_IsFunction(arg));
-macro IS_REGEXP(arg)            = (%_ClassOf(arg) === 'RegExp');
+macro IS_REGEXP(arg)            = (%_IsRegExp(arg));
 macro IS_DATE(arg)              = (%_ClassOf(arg) === 'Date');
 macro IS_NUMBER_WRAPPER(arg)    = (%_ClassOf(arg) === 'Number');
 macro IS_STRING_WRAPPER(arg)    = (%_ClassOf(arg) === 'String');
@@ -97,9 +111,11 @@ macro FLOOR(arg)                = $floor(arg);
 
 # Inline macros. Use %IS_VAR to make sure arg is evaluated only once.
 macro NUMBER_IS_NAN(arg) = (!%_IsSmi(%IS_VAR(arg)) && !(arg == arg));
-macro TO_INTEGER(arg)    = (%_IsSmi(%IS_VAR(arg)) ? arg : ToInteger(arg));
-macro TO_INT32(arg)      = (%_IsSmi(%IS_VAR(arg)) ? arg : (arg >> 0));
-macro TO_UINT32(arg)     = (arg >>> 0);
+macro TO_INTEGER(arg) = (%_IsSmi(%IS_VAR(arg)) ? arg : ToInteger(arg));
+macro TO_INT32(arg) = (%_IsSmi(%IS_VAR(arg)) ? arg : (arg >> 0));
+macro TO_UINT32(arg) = (arg >>> 0);
+macro TO_STRING_INLINE(arg) = (IS_STRING(%IS_VAR(arg)) ? arg : NonStringToString(arg));
+
 
 # Macros implemented in Python.
 python macro CHAR_CODE(str) = ord(str[1]);

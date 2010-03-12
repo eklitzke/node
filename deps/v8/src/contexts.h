@@ -76,7 +76,6 @@ enum ContextLookupFlags {
   V(TO_INTEGER_FUN_INDEX, JSFunction, to_integer_fun) \
   V(TO_UINT32_FUN_INDEX, JSFunction, to_uint32_fun) \
   V(TO_INT32_FUN_INDEX, JSFunction, to_int32_fun) \
-  V(TO_BOOLEAN_FUN_INDEX, JSFunction, to_boolean_fun) \
   V(GLOBAL_EVAL_FUN_INDEX, JSFunction, global_eval_fun) \
   V(INSTANTIATE_FUN_INDEX, JSFunction, instantiate_fun) \
   V(CONFIGURE_INSTANCE_FUN_INDEX, JSFunction, configure_instance_fun) \
@@ -96,6 +95,7 @@ enum ContextLookupFlags {
     call_as_constructor_delegate) \
   V(EMPTY_SCRIPT_INDEX, Script, empty_script) \
   V(SCRIPT_FUNCTION_INDEX, JSFunction, script_function) \
+  V(OPAQUE_REFERENCE_FUNCTION_INDEX, JSFunction, opaque_reference_function) \
   V(CONTEXT_EXTENSION_FUNCTION_INDEX, JSFunction, context_extension_function) \
   V(OUT_OF_MEMORY_INDEX, Object, out_of_memory) \
   V(MAP_CACHE_INDEX, Object, map_cache) \
@@ -217,6 +217,7 @@ class Context: public FixedArray {
     CALL_AS_CONSTRUCTOR_DELEGATE_INDEX,
     EMPTY_SCRIPT_INDEX,
     SCRIPT_FUNCTION_INDEX,
+    OPAQUE_REFERENCE_FUNCTION_INDEX,
     CONTEXT_EXTENSION_FUNCTION_INDEX,
     OUT_OF_MEMORY_INDEX,
     MAP_CACHE_INDEX,

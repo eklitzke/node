@@ -46,6 +46,7 @@
 #include "arm/regexp-macro-assembler-arm.h"
 #endif
 
+
 namespace v8 {
 namespace internal {
 
@@ -115,7 +116,7 @@ int Heap::gc_count_ = 0;
 
 int Heap::always_allocate_scope_depth_ = 0;
 int Heap::linear_allocation_scope_depth_ = 0;
-bool Heap::context_disposed_pending_ = false;
+int Heap::contexts_disposed_ = 0;
 
 #ifdef DEBUG
 bool Heap::allocation_allowed_ = true;
@@ -371,24 +372,6 @@ void Heap::CollectAllGarbage(bool force_compaction) {
 }
 
 
-void Heap::CollectAllGarbageIfContextDisposed() {
-  // If the garbage collector interface is exposed through the global
-  // gc() function, we avoid being clever about forcing GCs when
-  // contexts are disposed and leave it to the embedder to make
-  // informed decisions about when to force a collection.
-  if (!FLAG_expose_gc && context_disposed_pending_) {
-    HistogramTimerScope scope(&Counters::gc_context);
-    CollectAllGarbage(false);
-  }
-  context_disposed_pending_ = false;
-}
-
-
-void Heap::NotifyContextDisposed() {
-  context_disposed_pending_ = true;
-}
-
-
 bool Heap::CollectGarbage(int requested_size, AllocationSpace space) {
   // The VM is in the GC state until exiting this function.
   VMState state(GC);
@@ -558,12 +541,22 @@ void Heap::PerformGarbageCollection(AllocationSpace space,
   VerifySymbolTable();
   if (collector == MARK_COMPACTOR && global_gc_prologue_callback_) {
     ASSERT(!allocation_allowed_);
+    GCTracer::ExternalScope scope(tracer);
     global_gc_prologue_callback_();
   }
   EnsureFromSpaceIsCommitted();
+
+  // Perform mark-sweep with optional compaction.
   if (collector == MARK_COMPACTOR) {
     MarkCompact(tracer);
+  }
 
+  // Always perform a scavenge to make room in new space.
+  Scavenge();
+
+  // Update the old space promotion limits after the scavenge due to
+  // promotions during scavenge.
+  if (collector == MARK_COMPACTOR) {
     int old_gen_size = PromotedSpaceSize();
     old_gen_promotion_limit_ =
         old_gen_size + Max(kMinimumPromotionLimit, old_gen_size / 3);
@@ -571,12 +564,12 @@ void Heap::PerformGarbageCollection(AllocationSpace space,
         old_gen_size + Max(kMinimumAllocationLimit, old_gen_size / 2);
     old_gen_exhausted_ = false;
   }
-  Scavenge();
 
   Counters::objs_since_last_young.Set(0);
 
   if (collector == MARK_COMPACTOR) {
     DisableAssertNoAllocation allow_allocation;
+    GCTracer::ExternalScope scope(tracer);
     GlobalHandles::PostGarbageCollectionProcessing();
   }
 
@@ -591,6 +584,7 @@ void Heap::PerformGarbageCollection(AllocationSpace space,
 
   if (collector == MARK_COMPACTOR && global_gc_epilogue_callback_) {
     ASSERT(!allocation_allowed_);
+    GCTracer::ExternalScope scope(tracer);
     global_gc_epilogue_callback_();
   }
   VerifySymbolTable();
@@ -620,7 +614,8 @@ void Heap::MarkCompact(GCTracer* tracer) {
   Shrink();
 
   Counters::objs_since_last_full.Set(0);
-  context_disposed_pending_ = false;
+
+  contexts_disposed_ = 0;
 }
 
 
@@ -1221,6 +1216,16 @@ Object* Heap::AllocateMap(InstanceType instance_type, int instance_size) {
 }
 
 
+Object* Heap::AllocateCodeCache() {
+  Object* result = AllocateStruct(CODE_CACHE_TYPE);
+  if (result->IsFailure()) return result;
+  CodeCache* code_cache = CodeCache::cast(result);
+  code_cache->set_default_cache(empty_fixed_array());
+  code_cache->set_normal_type_cache(undefined_value());
+  return code_cache;
+}
+
+
 const Heap::StringTypeTable Heap::string_type_table[] = {
 #define STRING_TYPE_ELEMENT(type, size, name, camel_name)                      \
   {type, size, k##camel_name##MapRootIndex},
@@ -1498,12 +1503,6 @@ void Heap::CreateRegExpCEntryStub() {
 #endif
 
 
-void Heap::CreateCEntryDebugBreakStub() {
-  DebuggerStatementStub stub;
-  set_debugger_statement_code(*stub.GetCode());
-}
-
-
 void Heap::CreateJSEntryStub() {
   JSEntryStub stub;
   set_js_entry_code(*stub.GetCode());
@@ -1531,7 +1530,6 @@ void Heap::CreateFixedStubs() {
   // }
   // To workaround the problem, make separate functions without inlining.
   Heap::CreateCEntryStub();
-  Heap::CreateCEntryDebugBreakStub();
   Heap::CreateJSEntryStub();
   Heap::CreateJSConstructEntryStub();
 #if V8_TARGET_ARCH_ARM && V8_NATIVE_REGEXP
@@ -1644,7 +1642,7 @@ bool Heap::CreateInitialObjects() {
   if (InitializeNumberStringCache()->IsFailure()) return false;
 
   // Allocate cache for single character strings.
-  obj = AllocateFixedArray(String::kMaxAsciiCharCode+1);
+  obj = AllocateFixedArray(String::kMaxAsciiCharCode+1, TENURED);
   if (obj->IsFailure()) return false;
   set_single_character_string_cache(FixedArray::cast(obj));
 
@@ -1678,7 +1676,7 @@ Object* Heap::InitializeNumberStringCache() {
   // max_semispace_size_ ==   8 MB => number_string_cache_size = 16KB.
   int number_string_cache_size = max_semispace_size_ / 512;
   number_string_cache_size = Max(32, Min(16*KB, number_string_cache_size));
-  Object* obj = AllocateFixedArray(number_string_cache_size * 2);
+  Object* obj = AllocateFixedArray(number_string_cache_size * 2, TENURED);
   if (!obj->IsFailure()) set_number_string_cache(FixedArray::cast(obj));
   return obj;
 }
@@ -1774,6 +1772,7 @@ Object* Heap::SmiOrNumberFromDouble(double value,
 
 
 Object* Heap::NumberToString(Object* number) {
+  Counters::number_to_string_runtime.Increment();
   Object* cached = GetNumberStringCache(number);
   if (cached != undefined_value()) {
     return cached;
@@ -2000,7 +1999,8 @@ Object* Heap::AllocateConsString(String* first, String* second) {
 
 Object* Heap::AllocateSubString(String* buffer,
                                 int start,
-                                int end) {
+                                int end,
+                                PretenureFlag pretenure) {
   int length = end - start;
 
   if (length == 1) {
@@ -2016,16 +2016,13 @@ Object* Heap::AllocateSubString(String* buffer,
   }
 
   // Make an attempt to flatten the buffer to reduce access time.
-  if (!buffer->IsFlat()) {
-    buffer->TryFlatten();
-  }
+  buffer->TryFlatten();
 
   Object* result = buffer->IsAsciiRepresentation()
-      ? AllocateRawAsciiString(length)
-      : AllocateRawTwoByteString(length);
+      ? AllocateRawAsciiString(length, pretenure )
+      : AllocateRawTwoByteString(length, pretenure);
   if (result->IsFailure()) return result;
   String* string_result = String::cast(result);
-
   // Copy the characters into the new object.
   if (buffer->IsAsciiRepresentation()) {
     ASSERT(string_result->IsAsciiRepresentation());
@@ -2389,12 +2386,13 @@ Object* Heap::AllocateInitialMap(JSFunction* fun) {
   map->set_unused_property_fields(in_object_properties);
   map->set_prototype(prototype);
 
-  // If the function has only simple this property assignments add field
-  // descriptors for these to the initial map as the object cannot be
-  // constructed without having these properties.
+  // If the function has only simple this property assignments add
+  // field descriptors for these to the initial map as the object
+  // cannot be constructed without having these properties.  Guard by
+  // the inline_new flag so we only change the map if we generate a
+  // specialized construct stub.
   ASSERT(in_object_properties <= Map::kMaxPreAllocatedPropertyFields);
-  if (fun->shared()->has_only_simple_this_property_assignments() &&
-      fun->shared()->this_property_assignments_count() > 0) {
+  if (fun->shared()->CanGenerateInlineConstructor(prototype)) {
     int count = fun->shared()->this_property_assignments_count();
     if (count > in_object_properties) {
       count = in_object_properties;
@@ -2974,6 +2972,18 @@ Object* Heap::AllocateFixedArray(int length, PretenureFlag pretenure) {
 }
 
 
+Object* Heap::AllocateUninitializedFixedArray(int length) {
+  if (length == 0) return empty_fixed_array();
+
+  Object* obj = AllocateRawFixedArray(length);
+  if (obj->IsFailure()) return obj;
+
+  reinterpret_cast<FixedArray*>(obj)->set_map(fixed_array_map());
+  FixedArray::cast(obj)->set_length(length);
+  return obj;
+}
+
+
 Object* Heap::AllocateFixedArrayWithHoles(int length) {
   if (length == 0) return empty_fixed_array();
   Object* result = AllocateRawFixedArray(length);
@@ -2983,18 +2993,17 @@ Object* Heap::AllocateFixedArrayWithHoles(int length) {
     FixedArray* array = FixedArray::cast(result);
     array->set_length(length);
     // Initialize body.
-    Object* value = the_hole_value();
-    for (int index = 0; index < length; index++)  {
-      ASSERT(!Heap::InNewSpace(value));  // value = the hole
-      array->set(index, value, SKIP_WRITE_BARRIER);
-    }
+    ASSERT(!Heap::InNewSpace(the_hole_value()));
+    MemsetPointer(HeapObject::RawField(array, FixedArray::kHeaderSize),
+                  the_hole_value(),
+                  length);
   }
   return result;
 }
 
 
-Object* Heap::AllocateHashTable(int length) {
-  Object* result = Heap::AllocateFixedArray(length);
+Object* Heap::AllocateHashTable(int length, PretenureFlag pretenure) {
+  Object* result = Heap::AllocateFixedArray(length, pretenure);
   if (result->IsFailure()) return result;
   reinterpret_cast<Array*>(result)->set_map(hash_table_map());
   ASSERT(result->IsHashTable());
@@ -3077,6 +3086,7 @@ bool Heap::IdleNotification() {
   static int number_idle_notifications = 0;
   static int last_gc_count = gc_count_;
 
+  bool uncommit = true;
   bool finished = false;
 
   if (last_gc_count == gc_count_) {
@@ -3087,7 +3097,12 @@ bool Heap::IdleNotification() {
   }
 
   if (number_idle_notifications == kIdlesBeforeScavenge) {
-    CollectGarbage(0, NEW_SPACE);
+    if (contexts_disposed_ > 0) {
+      HistogramTimerScope scope(&Counters::gc_context);
+      CollectAllGarbage(false);
+    } else {
+      CollectGarbage(0, NEW_SPACE);
+    }
     new_space_.Shrink();
     last_gc_count = gc_count_;
 
@@ -3107,10 +3122,29 @@ bool Heap::IdleNotification() {
     last_gc_count = gc_count_;
     number_idle_notifications = 0;
     finished = true;
+
+  } else if (contexts_disposed_ > 0) {
+    if (FLAG_expose_gc) {
+      contexts_disposed_ = 0;
+    } else {
+      HistogramTimerScope scope(&Counters::gc_context);
+      CollectAllGarbage(false);
+      last_gc_count = gc_count_;
+    }
+    // If this is the first idle notification, we reset the
+    // notification count to avoid letting idle notifications for
+    // context disposal garbage collections start a potentially too
+    // aggressive idle GC cycle.
+    if (number_idle_notifications <= 1) {
+      number_idle_notifications = 0;
+      uncommit = false;
+    }
   }
 
-  // Uncommit unused memory in new space.
-  Heap::UncommitFromSpace();
+  // Make sure that we have no pending context disposals and
+  // conditionally uncommit from space.
+  ASSERT(contexts_disposed_ == 0);
+  if (uncommit) Heap::UncommitFromSpace();
   return finished;
 }
 
@@ -4072,6 +4106,7 @@ void Heap::TracePathToGlobal() {
 GCTracer::GCTracer()
     : start_time_(0.0),
       start_size_(0.0),
+      external_time_(0.0),
       gc_count_(0),
       full_gc_count_(0),
       is_compacting_(false),
@@ -4089,10 +4124,12 @@ GCTracer::GCTracer()
 GCTracer::~GCTracer() {
   if (!FLAG_trace_gc) return;
   // Printf ONE line iff flag is set.
-  PrintF("%s %.1f -> %.1f MB, %d ms.\n",
-         CollectorString(),
-         start_size_, SizeOfHeapObjects(),
-         static_cast<int>(OS::TimeCurrentMillis() - start_time_));
+  int time = static_cast<int>(OS::TimeCurrentMillis() - start_time_);
+  int external_time = static_cast<int>(external_time_);
+  PrintF("%s %.1f -> %.1f MB, ",
+         CollectorString(), start_size_, SizeOfHeapObjects());
+  if (external_time > 0) PrintF("%d / ", external_time);
+  PrintF("%d ms.\n", time);
 
 #if defined(ENABLE_LOGGING_AND_PROFILING)
   Heap::PrintShortHeapStatistics();
@@ -4116,7 +4153,7 @@ int KeyedLookupCache::Hash(Map* map, String* name) {
   // Uses only lower 32 bits if pointers are larger.
   uintptr_t addr_hash =
       static_cast<uint32_t>(reinterpret_cast<uintptr_t>(map)) >> kMapHashShift;
-  return (addr_hash ^ name->Hash()) & kCapacityMask;
+  return static_cast<uint32_t>((addr_hash ^ name->Hash()) & kCapacityMask);
 }
 
 

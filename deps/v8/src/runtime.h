@@ -60,6 +60,7 @@ namespace internal {
   F(GetArgumentsProperty, 1, 1) \
   F(ToFastProperties, 1, 1) \
   F(ToSlowProperties, 1, 1) \
+  F(FinishArrayPrototypeSetup, 1, 1) \
   \
   F(IsInPrototypeChain, 2, 1) \
   F(SetHiddenPrototype, 2, 1) \
@@ -71,10 +72,8 @@ namespace internal {
   F(IsExtensible, 1, 1) \
   \
   /* Utilities */ \
-  F(GetCalledFunction, 0, 1) \
   F(GetFunctionDelegate, 1, 1) \
   F(GetConstructorDelegate, 1, 1) \
-  F(NewArguments, 1, 1) \
   F(NewArgumentsFast, 3, 1) \
   F(LazyCompile, 1, 1) \
   F(SetNewFunctionAttributes, 1, 1) \
@@ -144,6 +143,7 @@ namespace internal {
   F(Math_floor, 1, 1) \
   F(Math_log, 1, 1) \
   F(Math_pow, 2, 1) \
+  F(Math_pow_cfunction, 2, 1) \
   F(Math_round, 1, 1) \
   F(Math_sin, 1, 1) \
   F(Math_sqrt, 1, 1) \
@@ -163,6 +163,7 @@ namespace internal {
   F(StringReplaceRegExpWithString, 4, 1) \
   F(StringMatch, 3, 1) \
   F(StringTrim, 3, 1) \
+  F(StringToArray, 1, 1) \
   \
   /* Numbers */ \
   F(NumberToRadixString, 2, 1) \
@@ -202,6 +203,7 @@ namespace internal {
   F(DateLocalTimezone, 1, 1) \
   F(DateLocalTimeOffset, 0, 1) \
   F(DateDaylightSavingsOffset, 1, 1) \
+  F(DateMakeDay, 3, 1) \
   \
   /* Numbers */ \
   F(NumberIsFinite, 1, 1) \
@@ -215,6 +217,8 @@ namespace internal {
   F(ResolvePossiblyDirectEval, 3, 2) \
   \
   F(SetProperty, -1 /* 3 or 4 */, 1) \
+  F(DefineOrRedefineDataProperty, 4, 1) \
+  F(DefineOrRedefineAccessorProperty, 5, 1) \
   F(IgnoreAttributesAndSetProperty, -1 /* 3 or 4 */, 1) \
   \
   /* Arrays */ \
@@ -266,7 +270,6 @@ namespace internal {
   F(InitializeConstGlobal, 2, 1) \
   F(InitializeConstContextSlot, 3, 1) \
   F(OptimizeObjectForAddingMultipleProperties, 2, 1) \
-  F(TransformToFastProperties, 1, 1) \
   \
   /* Debugging */ \
   F(DebugPrint, 1, 1) \
@@ -322,15 +325,22 @@ namespace internal {
   F(SystemBreak, 0, 1) \
   F(DebugDisassembleFunction, 1, 1) \
   F(DebugDisassembleConstructor, 1, 1) \
-  F(FunctionGetInferredName, 1, 1)
+  F(FunctionGetInferredName, 1, 1) \
+  F(LiveEditFindSharedFunctionInfosForScript, 1, 1) \
+  F(LiveEditGatherCompileInfo, 2, 1) \
+  F(LiveEditReplaceScript, 3, 1) \
+  F(LiveEditReplaceFunctionCode, 2, 1) \
+  F(LiveEditRelinkFunctionToScript, 2, 1) \
+  F(LiveEditPatchFunctionPositions, 2, 1) \
+  F(LiveEditCheckStackActivations, 1, 1)
 #else
 #define RUNTIME_FUNCTION_LIST_DEBUGGER_SUPPORT(F)
 #endif
 
 #ifdef ENABLE_LOGGING_AND_PROFILING
 #define RUNTIME_FUNCTION_LIST_PROFILER_SUPPORT(F) \
-  F(ProfilerResume, 1, 1) \
-  F(ProfilerPause, 1, 1)
+  F(ProfilerResume, 2, 1) \
+  F(ProfilerPause, 2, 1)
 #else
 #define RUNTIME_FUNCTION_LIST_PROFILER_SUPPORT(F)
 #endif
@@ -401,6 +411,7 @@ class Runtime : public AllStatic {
   // Support getting the characters in a string using [] notation as
   // in Firefox/SpiderMonkey, Safari and Opera.
   static Object* GetElementOrCharAt(Handle<Object> object, uint32_t index);
+  static Object* GetElement(Handle<Object> object, uint32_t index);
 
   static Object* SetObjectProperty(Handle<Object> object,
                                    Handle<Object> key,

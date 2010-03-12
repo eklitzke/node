@@ -3,7 +3,7 @@ path = require("path");
 libDir = path.join(path.dirname(__filename), "../lib");
 require.paths.unshift(libDir);
 
-process.mixin(require("sys"));
+var puts = require("sys").puts;
 http = require("http");
 
 fixed = ""
@@ -47,12 +47,11 @@ http.createServer(function (req, res) {
 
   var content_length = body.length.toString();
 
-  res.sendHeader( status 
+  res.writeHead( status 
                 , { "Content-Type": "text/plain"
                   , "Content-Length": content_length
                   }
                 );
-  res.sendBody(body);
-          
-  res.finish();
+  res.write(body);
+  res.close();
 }).listen(8000);

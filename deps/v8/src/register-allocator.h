@@ -29,6 +29,7 @@
 #define V8_REGISTER_ALLOCATOR_H_
 
 #include "macro-assembler.h"
+#include "number-info.h"
 
 #if V8_TARGET_ARCH_IA32
 #include "ia32/register-allocator-ia32.h"
@@ -36,6 +37,8 @@
 #include "x64/register-allocator-x64.h"
 #elif V8_TARGET_ARCH_ARM
 #include "arm/register-allocator-arm.h"
+#elif V8_TARGET_ARCH_MIPS
+#include "mips/register-allocator-mips.h"
 #else
 #error Unsupported target architecture.
 #endif
@@ -62,28 +65,21 @@ class Result BASE_EMBEDDED {
   Result() { invalidate(); }
 
   // Construct a register Result.
-  explicit Result(Register reg);
+  explicit Result(Register reg, NumberInfo info = NumberInfo::Unknown());
 
   // Construct a Result whose value is a compile-time constant.
   explicit Result(Handle<Object> value) {
     value_ = TypeField::encode(CONSTANT)
+        | NumberInfoField::encode(NumberInfo::Uninitialized().ToInt())
         | DataField::encode(ConstantList()->length());
     ConstantList()->Add(value);
   }
 
   // The copy constructor and assignment operators could each create a new
   // register reference.
-  Result(const Result& other) {
-    other.CopyTo(this);
-  }
+  inline Result(const Result& other);
 
-  Result& operator=(const Result& other) {
-    if (this != &other) {
-      Unuse();
-      other.CopyTo(this);
-    }
-    return *this;
-  }
+  inline Result& operator=(const Result& other);
 
   inline ~Result();
 
@@ -104,6 +100,13 @@ class Result BASE_EMBEDDED {
   Type type() const { return TypeField::decode(value_); }
 
   void invalidate() { value_ = TypeField::encode(INVALID); }
+
+  inline NumberInfo number_info() const;
+  inline void set_number_info(NumberInfo info);
+  inline bool is_number() const;
+  inline bool is_smi() const;
+  inline bool is_integer32() const;
+  inline bool is_heap_number() const;
 
   bool is_valid() const { return type() != INVALID; }
   bool is_register() const { return type() == REGISTER; }
@@ -136,7 +139,8 @@ class Result BASE_EMBEDDED {
   uint32_t value_;
 
   class TypeField: public BitField<Type, 0, 2> {};
-  class DataField: public BitField<uint32_t, 2, 32 - 3> {};
+  class NumberInfoField : public BitField<int, 2, 4> {};
+  class DataField: public BitField<uint32_t, 6, 32 - 6> {};
 
   inline void CopyTo(Result* destination) const;
 
@@ -235,18 +239,18 @@ class RegisterAllocator BASE_EMBEDDED {
 
   // Predicates and accessors for the registers' reference counts.
   bool is_used(int num) { return registers_.is_used(num); }
-  bool is_used(Register reg) { return registers_.is_used(ToNumber(reg)); }
+  inline bool is_used(Register reg);
 
   int count(int num) { return registers_.count(num); }
-  int count(Register reg) { return registers_.count(ToNumber(reg)); }
+  inline int count(Register reg);
 
   // Explicitly record a reference to a register.
   void Use(int num) { registers_.Use(num); }
-  void Use(Register reg) { registers_.Use(ToNumber(reg)); }
+  inline void Use(Register reg);
 
   // Explicitly record that a register will no longer be used.
   void Unuse(int num) { registers_.Unuse(num); }
-  void Unuse(Register reg) { registers_.Unuse(ToNumber(reg)); }
+  inline void Unuse(Register reg);
 
   // Reset the register reference counts to free all non-reserved registers.
   void Reset() { registers_.Reset(); }
